@@ -15,8 +15,9 @@ extension that also finds the files you *didn't* sync.
   opens them in the browser.
 - The folder selection ("profile") is stored on a Google Drive remote, one per
   machine, so it is shared by both OSes of a dual-boot computer.
-- The search extension lists matching cloud-only files in the overview search;
-  clicking one opens it in the browser.
+- The GNOME Shell extension lists matching cloud-only files in the overview
+  search (click: open in the browser, Ctrl+click: open the folder in the
+  Cloud Sync window to add it), and shows the sync state in the top bar.
 
 ## Install (Linux)
 
@@ -49,7 +50,7 @@ For the search extension, log out and in once (Wayland), then
 
 ## Commands
 
-- `cloudsync gui [--tk]`: pick folders per remote
+- `cloudsync gui [--tk] [--show REMOTE:PATH]`: pick folders per remote, optionally opened at a folder
 - `cloudsync sync [REMOTE|PAIR …] [--dry-run] [--resync] [--notify]`
 - `cloudsync status`: what is selected, free disk space
 - `cloudsync pair add NAME LOCAL REMOTE [--filter '+ /sub/**' …]`, `cloudsync pair remove NAME`
@@ -72,13 +73,25 @@ In pairs, Python caches, `.pixi`, `.venv` and `node_modules` are skipped;
 `.git` folders are synced, so don't work on the same repo on two computers
 between syncs.
 
-## Search extension
+## GNOME Shell extension
 
-`cloudsync index` lists the file and folder names of every enabled remote
-(no content is downloaded). The extension (`search/`) searches that list as you
+`search/cloudsync-search@htlemke.github.io`, installed by `install.sh`.
+
+**Search.** `cloudsync index` lists the file and folder names of every enabled
+remote (no content is downloaded). The extension searches that list as you
 type and leaves out results that exist locally, since the normal file search
-finds those. Google Drive results open in the browser; clicking the section
-header opens Google Drive's own search.
+finds those.
+
+- Click: open in the browser. Google Drive works out of the box, Nextcloud/
+  ownCloud WebDAV remotes get links to their web UI from the rclone config.
+- Ctrl+click: open the folder (or the file's folder) in the Cloud Sync window
+  to add it to the sync.
+- Click on the section header: Google Drive's own web search.
+
+**Top bar.** An icon shows the sync state (from `~/.cache/cloudsync/status.json`,
+written by `cloudsync sync`): idle, syncing, or a warning when the last sync
+failed or the last good one is more than 3 hours old. The menu has *Sync now*,
+*Open Cloud Sync*, *Refresh search index* and *Open logs*.
 
 ## Dual boot with Windows
 

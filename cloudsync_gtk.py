@@ -41,6 +41,7 @@ class Window(Adw.ApplicationWindow):
         self.bound = {}  # remote -> {list item: (folder, check, size label)}
         self.updating = False
         self.switches = {}
+        self.models = {}  # remote -> (TreeListModel, ListView)
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -99,8 +100,9 @@ class Window(Adw.ApplicationWindow):
         factory.connect("setup", self.setup_row)
         factory.connect("bind", self.bind_row, name)
         factory.connect("unbind", lambda _f, li: self.bound[name].pop(li, None))
-        lv = Gtk.ListView(model=Gtk.NoSelection(model=model), factory=factory,
-                          css_classes=["navigation-sidebar"])
+        lv = Gtk.ListView(model=Gtk.SingleSelection(model=model, autoselect=False),
+                          factory=factory, css_classes=["navigation-sidebar"])
+        self.models[name] = (model, lv)
         frame = Gtk.Frame(child=Gtk.ScrolledWindow(child=lv, vexpand=True),
                           margin_start=12, margin_end=12, margin_top=12, margin_bottom=12)
         box.append(frame)
@@ -189,6 +191,39 @@ class Window(Adw.ApplicationWindow):
         bg(lambda: self.cs.folder_size(f.remote, f.path), done,
            lambda e: (self.busy(-1), self.toast(f"Size failed: {e}")))
 
+    def reveal(self, remote, path):
+        """Show remote's page with the tree opened down to path."""
+        if remote not in self.models:
+            self.toast(f"No rclone remote {remote!r}")
+            return
+        self.stack.set_visible_child_name(remote)
+        model, lv = self.models[remote]
+        parts = [p for p in path.split("/") if p]
+
+        def step(row, i):
+            if i == len(parts):
+                pos = row.get_position()
+                lv.scroll_to(pos, Gtk.ListScrollFlags.FOCUS | Gtk.ListScrollFlags.SELECT, None)
+                self.toast(f"Tick “{row.get_item().name}” to sync it, then Save")
+                return
+            f = row.get_item()
+            row.set_expanded(True)
+            self.on_expand(row)  # rows off screen have no expand handler yet
+
+            def wait():
+                if f.loading:
+                    return True  # still listing, check again
+                if not f.loaded:
+                    return False  # listing failed, already shown as a toast
+                for k in range(f.children.get_n_items()):
+                    if f.children.get_item(k).name == parts[i]:
+                        step(row.get_child_row(k), i + 1)
+                        return False
+                self.toast(f"Not found: {remote}:{path}")
+                return False
+            GLib.timeout_add(100, wait)
+        step(model.get_row(0), 0)
+
     # --- save / sync ----------------------------------------------------------
 
     def save(self, then_sync):
@@ -246,7 +281,17 @@ class Window(Adw.ApplicationWindow):
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=4))
 
 
-def run(cs):
-    app = Adw.Application(application_id=APP_ID)
-    app.connect("activate", lambda a: (a.get_active_window() or Window(a, cs)).present())
-    return app.run([])
+def run(cs, show=None):
+    """show: "remote:path" to open at; a second call reuses the open window."""
+    app = Adw.Application(application_id=APP_ID,
+                          flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+
+    def command_line(a, cl):
+        win = a.get_active_window() or Window(a, cs)
+        win.present()
+        args = cl.get_arguments()[1:]
+        if args and ":" in args[0]:
+            win.reveal(*args[0].split(":", 1))
+        return 0
+    app.connect("command-line", command_line)
+    return app.run(["cloudsync"] + ([show] if show else []))

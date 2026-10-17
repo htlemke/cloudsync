@@ -23,7 +23,7 @@ Per OS: rclone.conf (tokens; same remote names on both OSes) and
 On a dual-boot laptop, point both OSes at the same folder on a shared NTFS disk.
 
 Usage:
-    cloudsync gui
+    cloudsync gui [--show REMOTE:PATH]
     cloudsync sync [REMOTE ...] [--resync] [--dry-run] [--notify]
     cloudsync status
     cloudsync index [REMOTE ...]
@@ -36,11 +36,14 @@ import json
 import os
 import platform
 import queue
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import threading
+import time
+from urllib.parse import quote
 from pathlib import Path
 
 SETTINGS_REMOTE = "gdrive"
@@ -250,6 +253,22 @@ def remove_local(top, paths):
         shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
 
 
+def clear_stale_locks(workdir):
+    """Remove bisync lock files whose process is gone (e.g. after a logout or
+    a crash), instead of waiting for --max-lock to expire. On a dual-boot disk
+    a lock from the other OS is stale too: only one OS runs at a time."""
+    if IS_WINDOWS:
+        return
+    for lck in workdir.glob("*.lck"):
+        try:
+            pid = int(json.loads(lck.read_text())["PID"])
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            lck.unlink(missing_ok=True)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # unreadable, or the process exists (PermissionError)
+
+
 def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False,
            extra=()):
     """rclone bisync path1 <-> path2; key names the filter, marker and log files."""
@@ -263,6 +282,7 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
     # bisync names its listings after the real local path, which differs between
     # Linux and Windows, so each OS keeps its own listings and its own marker
     marker = sd / "bisync" / f"{key}.{platform.system().lower()}.cloudsync-ok"
+    clear_stale_locks(sd / "bisync")
     # first run, or selection changed since the last good run -> resync
     if not marker.exists() or marker.read_text().strip() != digest:
         resync = True
@@ -315,7 +335,41 @@ def sync_pair(name, cfg, resync=False, dry_run=False):
                   resync, dry_run)
 
 
+def status_file():
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache / "cloudsync" / "status.json"
+
+
+def write_status(**fields):
+    """Sync state for the top-bar indicator of the search extension."""
+    f = status_file()
+    try:
+        old = json.loads(f.read_text())
+    except (OSError, ValueError):
+        old = {}
+    old.update(fields)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(old, indent=1))
+    os.replace(tmp, f)
+
+
 def cmd_sync(args):
+    if args.dry_run:
+        return run_sync(args)
+    write_status(state="running", pid=os.getpid(), started=time.time())
+    try:
+        rc = run_sync(args)
+    except BaseException:
+        write_status(state="failed", finished=time.time(), failed=["(crashed)"])
+        raise
+    write_status(state="failed" if rc else "ok", finished=time.time(),
+                 failed=run_sync.failed, logs=str(state_dir() / "logs"),
+                 **({} if rc else {"last_ok": time.time()}))
+    return rc
+
+
+def run_sync(args):
     prof, online = load_profile()
     remotes = list_remotes()
     failed = []
@@ -345,6 +399,7 @@ def cmd_sync(args):
             failed.append(name)
     if not online:
         print("note: gdrive unreachable, used the cached profile")
+    run_sync.failed = failed
     if failed and args.notify and shutil.which("notify-send"):
         subprocess.run(["notify-send", "cloudsync failed", ", ".join(failed) +
                         f"\nsee {state_dir() / 'logs'}"])
@@ -404,6 +459,20 @@ DRIVE_URL = "https://drive.google.com/open?id={id}"
 DRIVE_SEARCH = "https://drive.google.com/drive/search?q={terms}"
 
 
+def web_links(name, rtype, conf):
+    """(result URL template, search URL template) for the remote's web UI.
+    Placeholders: {id}, {path}, {dir}, {name}, {terms}."""
+    if rtype == "drive":
+        return DRIVE_URL, DRIVE_SEARCH
+    if rtype == "webdav" and conf.get("vendor") in ("nextcloud", "owncloud"):
+        m = re.match(r"(https?://.+?)/remote\.php/(?:dav/files/[^/]+|webdav)(/.*?)?/?$",
+                     conf.get("url", ""))
+        if m:
+            sub = quote((m[2] or "").rstrip("/"))
+            return f"{m[1]}/index.php/apps/files/?dir={sub}/{{dir}}&scrollto={{name}}", ""
+    return "", ""
+
+
 def index_file():
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return cache / "cloudsync" / "index.tsv"
@@ -431,6 +500,7 @@ def cmd_index(args):
     remotes = list_remotes()
     names = [n for n, cfg in prof["remotes"].items()
              if cfg.get("enabled") and n in remotes]
+    configs = json.loads(rclone("config", "dump").stdout)
     out = index_file()
     old = read_index_blocks(out)
     blocks, failed = {}, []
@@ -451,9 +521,8 @@ def cmd_index(args):
             if name in old:
                 blocks[name] = old[name]
             continue
-        drive = remotes[name] == "drive"
-        head = "\t".join(["#source", name, name, str(local_root() / name),
-                          DRIVE_URL if drive else "", DRIVE_SEARCH if drive else ""])
+        url, search = web_links(name, remotes[name], configs.get(name, {}))
+        head = "\t".join(["#source", name, name, str(local_root() / name), url, search])
         items = json.loads(r.stdout or "[]")
         blocks[name] = [head] + [f"{name}\t{int(it['IsDir'])}\t{it.get('ID', '')}\t{tsv(it['Path'])}"
                                  for it in items]
@@ -518,7 +587,7 @@ def cmd_gui(args):
         except (ImportError, ValueError):
             pass  # no GTK 4 / libadwaita: fall back to Tk
         else:
-            return cloudsync_gtk.run(sys.modules[__name__])
+            return cloudsync_gtk.run(sys.modules[__name__], args.show)
     return gui_tk()
 
 
@@ -692,6 +761,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     g = sub.add_parser("gui")
     g.add_argument("--tk", action="store_true", help="use the Tk window (default on Windows)")
+    g.add_argument("--show", metavar="REMOTE:PATH", help="open at this folder (GNOME window)")
     s = sub.add_parser("sync")
     s.add_argument("remote", nargs="*")
     s.add_argument("--resync", action="store_true", help="force a resync")
