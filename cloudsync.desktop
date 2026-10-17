@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Cloud Sync
+Comment=Choose which cloud folders rclone syncs
+Exec=cloudsync gui
+Icon=folder-remote
+Categories=Network;FileTransfer;
+Terminal=false
+StartupWMClass=io.github.htlemke.CloudSync

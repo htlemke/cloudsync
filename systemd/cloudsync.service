@@ -1,0 +1,10 @@
+[Unit]
+Description=cloudsync: rclone bisync of the selected cloud folders
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cloudsync sync --notify
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
+IOSchedulingClass=idle

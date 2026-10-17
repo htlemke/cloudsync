@@ -1,0 +1,8 @@
+{
+  "uuid": "cloudsync-search@htlemke.github.io",
+  "name": "Cloud search (cloudsync)",
+  "description": "Find files of your rclone remotes in the overview search, also those that aren't synced locally. Uses the index written by `cloudsync index`.",
+  "shell-version": ["45", "46", "47", "48"],
+  "url": "https://github.com/htlemke/cloudsync",
+  "version": 1
+}

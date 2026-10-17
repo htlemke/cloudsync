@@ -1,0 +1,9 @@
+[Unit]
+Description=cloudsync: refresh the file-name index for the search extension
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cloudsync index
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=10
