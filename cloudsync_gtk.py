@@ -1,6 +1,8 @@
 """GNOME (GTK 4 / libadwaita) window for cloudsync. Linux only; Windows uses Tk."""
 
+import os
 import threading
+from pathlib import Path
 
 import gi
 
@@ -73,6 +75,10 @@ class Window(Adw.ApplicationWindow):
         for name in self.sel.remotes:
             self.stack.add_titled_with_icon(self.page(name), name, name,
                                             "folder-remote-symbolic")
+        self.stack.add_titled_with_icon(self.history_page(), "history", "History",
+                                        "document-open-recent-symbolic")
+        self.stack.add_titled_with_icon(self.settings_page(), "settings", "Settings",
+                                        "preferences-system-symbolic")
         if not self.sel.online:
             self.toast("gdrive unreachable – showing the cached selection")
 
@@ -227,6 +233,7 @@ class Window(Adw.ApplicationWindow):
     # --- save / sync ----------------------------------------------------------
 
     def save(self, then_sync):
+        self.read_settings()
         try:
             gone = self.sel.save()
         except RuntimeError as e:
@@ -269,6 +276,137 @@ class Window(Adw.ApplicationWindow):
            lambda e: (self.sync_btn.set_sensitive(True), self.busy(-1),
                       self.toast(f"Sync failed: {e}")))
 
+    # --- history ----------------------------------------------------------------
+
+    ACTION_ICONS = {"new": "list-add-symbolic", "changed": "document-edit-symbolic",
+                    "deleted": "user-trash-symbolic", "moved": "go-next-symbolic",
+                    "conflict": "dialog-warning-symbolic"}
+
+    def history_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=12)
+        self.history_filter = Gtk.SearchEntry(placeholder_text="Filter by file or folder",
+                                              hexpand=True)
+        self.history_filter.connect("search-changed", lambda *_: self.fill_history())
+        self.history_cloud = Gtk.CheckButton(label="Only changes from the cloud")
+        self.history_cloud.connect("toggled", lambda *_: self.fill_history())
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reload")
+        refresh.connect("clicked", lambda *_: self.fill_history())
+        for w in (self.history_filter, self.history_cloud, refresh):
+            bar.append(w)
+        box.append(bar)
+        self.history_list = Gtk.ListBox(css_classes=["boxed-list"], selection_mode=Gtk.SelectionMode.NONE)
+        self.history_list.set_placeholder(Gtk.Label(label="No changes recorded yet",
+                                                    css_classes=["dim-label"], margin_top=24))
+        scroll = Gtk.ScrolledWindow(child=self.history_list, vexpand=True,
+                                    margin_start=12, margin_end=12, margin_top=12, margin_bottom=12)
+        box.append(scroll)
+        self.fill_history()
+        return box
+
+    def fill_history(self):
+        self.history_list.remove_all()
+        text = self.history_filter.get_text().lower()
+        cloud_only = self.history_cloud.get_active()
+        shown = 0
+        for e in self.cs.read_history(3000):
+            if text and text not in e.get("path", "").lower():
+                continue
+            if cloud_only and e.get("side") != "cloud" and e.get("action") != "conflict":
+                continue
+            self.history_list.append(self.history_row(e))
+            shown += 1
+            if shown >= 300:
+                break
+
+    def history_row(self, e):
+        when = GLib.DateTime.new_from_unix_local(int(e.get("t", 0))).format("%Y-%m-%d %H:%M")
+        action, side = e.get("action", ""), e.get("side", "")
+        if action == "conflict":
+            what = f"conflict, {side} version saved in the backup"
+        else:
+            what = f"{action} {'in the cloud' if side == 'cloud' else 'here'}"
+        if e.get("who"):
+            what += f" by {e['who']}"
+        if e.get("old"):
+            what += f" (was {e['old']})"
+        row = Adw.ActionRow(title=GLib.markup_escape_text(e.get("path", "")),
+                            subtitle=GLib.markup_escape_text(
+                                f"{when} · {self.cs.remote_label(e.get('remote', ''))} · {what}"))
+        row.add_prefix(Gtk.Image(icon_name=self.ACTION_ICONS.get(action, "emblem-default-symbolic")))
+        key = e.get("remote", "")
+        local = self.local_of(key)
+        if local:
+            path = local / e.get("path", "")
+            btn = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text="Show the folder",
+                             valign=Gtk.Align.CENTER, css_classes=["flat"])
+            btn.connect("clicked", lambda *_: self.open_path(path if path.exists() else path.parent))
+            row.add_suffix(btn)
+        if e.get("backup"):
+            b = Gtk.Button(icon_name="document-revert-symbolic", valign=Gtk.Align.CENTER,
+                           tooltip_text="Show the saved older version", css_classes=["flat"])
+            b.connect("clicked", lambda *_: self.open_path(Path(e["backup"]).parent))
+            row.add_suffix(b)
+        return row
+
+    def local_of(self, key):
+        if key.startswith("pair-"):
+            pair = self.sel.prof.get("pairs", {}).get(key[5:])
+            return Path(os.path.expanduser(pair["local"])) if pair else None
+        return self.cs.local_root() / key
+
+    def open_path(self, path):
+        Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(str(path)).get_uri(), None)
+
+    # --- settings ----------------------------------------------------------------
+
+    def settings_page(self):
+        s = self.cs.settings(self.sel.prof)
+        page = Adw.PreferencesPage()
+        notif = Adw.PreferencesGroup(title="Notifications",
+                                     description="For changes that come from the cloud")
+        modes = ["off", "summary", "each"]
+        self.notify_row = Adw.ComboRow(title="Notify",
+                                       model=Gtk.StringList.new(["Off", "One summary", "Each file"]),
+                                       selected=modes.index(s["notify"]))
+        self.notify_own = Adw.SwitchRow(title="Also my own changes",
+                                        subtitle="e.g. made on another computer", active=s["notify_own"])
+        notif.add(self.notify_row)
+        notif.add(self.notify_own)
+        page.add(notif)
+        backup = Adw.PreferencesGroup(
+            title="Backup",
+            description="Versions replaced or deleted by a change from the cloud, and the "
+                        "losing side of a conflict, are kept here (local only)")
+        self.backup_days = Adw.SpinRow.new_with_range(1, 3650, 1)
+        self.backup_days.set_title("Keep for days")
+        self.backup_days.set_value(s["backup_days"])
+        backup.add(self.backup_days)
+        open_row = Adw.ActionRow(title="Backup folder", subtitle=str(self.cs.backup_root()),
+                                 activatable=True)
+        open_row.add_suffix(Gtk.Image(icon_name="folder-open-symbolic"))
+        open_row.connect("activated", lambda *_: (self.cs.backup_root().mkdir(parents=True, exist_ok=True),
+                                                  self.open_path(self.cs.backup_root())))
+        backup.add(open_row)
+        page.add(backup)
+        watch = Adw.PreferencesGroup(title="Watching",
+                                     description="Seconds between asking the clouds for changes")
+        self.poll = Adw.SpinRow.new_with_range(10, 3600, 5)
+        self.poll.set_title("Check every")
+        self.poll.set_value(s["poll_seconds"])
+        watch.add(self.poll)
+        page.add(watch)
+        self.modes = modes
+        return page
+
+    def read_settings(self):
+        """Settings from the widgets into the profile (saved with the selection)."""
+        s = self.sel.prof.setdefault("settings", {})
+        s["notify"] = self.modes[self.notify_row.get_selected()]
+        s["notify_own"] = self.notify_own.get_active()
+        s["backup_days"] = int(self.backup_days.get_value())
+        s["poll_seconds"] = int(self.poll.get_value())
+
     # --- helpers --------------------------------------------------------------
 
     _busy = 0
@@ -290,7 +428,10 @@ def run(cs, show=None):
         win = a.get_active_window() or Window(a, cs)
         win.present()
         args = cl.get_arguments()[1:]
-        if args and ":" in args[0]:
+        if args and args[0] == "@history":
+            win.fill_history()
+            win.stack.set_visible_child_name("history")
+        elif args and ":" in args[0]:
             win.reveal(*args[0].split(":", 1))
         return 0
     app.connect("command-line", command_line)

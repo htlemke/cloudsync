@@ -20,6 +20,6 @@ cat <<MSG
 Installed. Next:
   cloudsync init --machine NAME          # once per computer
   cloudsync gui                          # pick folders, then
-  systemctl --user enable --now cloudsync.timer cloudsync-index.timer
+  systemctl --user enable --now cloudsync.timer cloudsync-index.timer cloudsync-watch.service
   gnome-extensions enable $UUID   # after logging out and in once (Wayland)
 MSG

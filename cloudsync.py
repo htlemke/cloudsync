@@ -27,10 +27,14 @@ Usage:
     cloudsync sync [REMOTE ...] [--resync] [--dry-run] [--notify]
     cloudsync status
     cloudsync index [REMOTE ...]
+    cloudsync watch
+    cloudsync config [KEY [VALUE]]
     cloudsync init [--machine NAME]
 """
 
 import argparse
+import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -54,6 +58,9 @@ IS_WINDOWS = platform.system() == "Windows"
 WINDOWS_ENCODING = ("Slash,LtGt,DoubleQuote,Colon,Question,Asterisk,Pipe,"
                     "BackSlash,Ctl,RightSpace,RightPeriod,InvalidUtf8,Dot")
 JUNK = ["**/.DS_Store", "**/Thumbs.db", "**/desktop.ini", "**/~$*", "**/.~lock.*#"]
+# folders containing one of these files are never synced (Python virtualenvs,
+# whatever they are called: thousands of files that are useless elsewhere)
+EXCLUDE_IF_PRESENT = ["pyvenv.cfg"]
 
 
 # --- configuration ---------------------------------------------------------
@@ -101,6 +108,116 @@ def list_remotes():
         if name:
             remotes[name.strip()] = typ.strip()
     return remotes
+
+
+def data_dir():
+    """Per-OS place for the change history (not on the shared disk)."""
+    if IS_WINDOWS:
+        return config_dir()
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "cloudsync"
+
+
+def cache_dir():
+    if IS_WINDOWS:
+        return config_dir() / "cache"
+    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "cloudsync"
+
+
+@contextlib.contextmanager
+def sync_lock():
+    """One sync at a time: the timer's `cloudsync sync` and the watcher."""
+    if IS_WINDOWS:
+        yield
+        return
+    import fcntl
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    with open(cache_dir() / "sync.lock", "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# --- settings ----------------------------------------------------------------
+
+# Stored in the profile under "settings", so per machine and shared by its OSes.
+DEFAULT_SETTINGS = {
+    "notify": "summary",       # changes from the cloud: "off", "summary" or "each"
+    "notify_own": False,       # also notify changes made by me (e.g. on another computer)
+    "backup_days": 90,         # keep replaced/deleted/conflict versions this long
+    "poll_seconds": 30,        # watcher: how often to ask the clouds for changes
+    "index_remotes": [],       # remotes to list for the search without syncing them
+    "labels": {},              # remote -> name shown in search results and history
+}
+
+
+def settings(prof):
+    return {**DEFAULT_SETTINGS, **prof.get("settings", {})}
+
+
+def remote_label(key, prof=None):
+    """Name shown for a remote or pair ("pair-mypy") in search, history, notifications."""
+    if prof is None:
+        try:
+            prof = json.loads((state_dir() / "profile-cache.json").read_text())
+        except (OSError, ValueError):
+            prof = {}
+    labels = settings(prof)["labels"]
+    if key in labels:
+        return labels[key]
+    if key.startswith("pair-"):
+        return f"{key[5:]} (folder pair)"
+    return key
+
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Cloud Sync", "-i", "folder-remote", title, body])
+
+
+# --- history -----------------------------------------------------------------
+
+def history_file():
+    return data_dir() / "history.jsonl"
+
+
+def add_history(entries):
+    """entries: dicts with remote, path, action (new, changed, deleted, moved,
+    conflict, replaced), side (cloud = change came from the cloud, local), and
+    optionally who, via (watch/sync), backup (path of the saved old version)."""
+    if not entries:
+        return
+    f = history_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with open(f, "a", encoding="utf-8") as out:
+        for e in entries:
+            out.write(json.dumps({"t": now, **e}, ensure_ascii=False) + "\n")
+
+
+def read_history(limit=500):
+    f = history_file()
+    if not f.exists():
+        return []
+    lines = f.read_text(encoding="utf-8").splitlines()[-limit:]
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def prune_history(days):
+    f = history_file()
+    if not f.exists():
+        return
+    cutoff = time.time() - days * 86400
+    keep = [line for line in f.read_text(encoding="utf-8").splitlines()
+            if line and json.loads(line).get("t", 0) >= cutoff]
+    f.write_text("".join(line + "\n" for line in keep), encoding="utf-8")
 
 
 # --- profile ---------------------------------------------------------------
@@ -253,6 +370,92 @@ def remove_local(top, paths):
         shutil.rmtree(p) if p.is_dir() else p.unlink(missing_ok=True)
 
 
+def backup_root():
+    return local_root() / ".backup"
+
+
+def stamp(t=None):
+    return datetime.datetime.fromtimestamp(t or time.time()).strftime("%Y-%m-%d %H.%M")
+
+
+STAMP_RE = re.compile(r" \((\d{4}-\d\d-\d\d) \d\d\.\d\d[^)]*\)")
+LOSER_RE = re.compile(r"^(?P<stem>.+?)\.cs-(?P<side>local|cloud)\d+(?P<ext>\.[^.]+)?$")
+
+
+def backup_name(name, note=""):
+    """'report.docx' -> 'report (2026-10-18 14.03 note).docx'"""
+    stem, dot, ext = name.rpartition(".")
+    if not stem:
+        stem, dot, ext = name, "", ""
+    return f"{stem} ({stamp()}{' ' + note if note else ''}){dot}{ext}"
+
+
+SKIP_DIRS = {".pixi", ".venv", "node_modules", "__pycache__", ".ipynb_checkpoints"}
+
+
+def fix_conflicts(key, path1, path2):
+    """bisync keeps both versions of a conflict on both sides, the loser renamed
+    to NAME.cs-local1.ext / NAME.cs-cloud1.ext. Move every loser into the local
+    backup and delete its copy in the cloud, so the cloud only has the winner."""
+    path1 = Path(path1)
+    losers = []
+    for dirpath, dirs, files in os.walk(path1):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            m = LOSER_RE.match(f)
+            if m:
+                losers.append((Path(dirpath), f, m))
+    if not losers:
+        return []
+    entries, dirs = [], set()
+    for d, f, m in losers:
+        rel_dir = d.relative_to(path1)
+        original = m["stem"] + (m["ext"] or "")
+        target = backup_root() / key / rel_dir / backup_name(original, f"conflict, {m['side']} version")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(d / f), str(target))
+        rel_dir = "" if rel_dir == Path(".") else rel_dir.as_posix()
+        dirs.add(rel_dir)
+        entries.append({"path": f"{rel_dir}/{original}" if rel_dir else original,
+                        "action": "conflict", "side": m["side"], "backup": str(target)})
+    for rel_dir in dirs:
+        rclone("delete", f"{path2.rstrip('/')}/{rel_dir}" if rel_dir else path2,
+               "--max-depth", "1", "--include", "*.cs-local[0-9]*",
+               "--include", "*.cs-cloud[0-9]*", check=False)
+    return entries
+
+
+def prune_backups(days):
+    """Delete backups older than `days` (date from the name), then empty folders."""
+    top = backup_root()
+    if not top.is_dir():
+        return
+    cutoff = datetime.date.today() - datetime.timedelta(days=days)
+    for dirpath, dirs, files in os.walk(top, topdown=False):
+        for f in files:
+            m = STAMP_RE.search(f)
+            if m and datetime.date.fromisoformat(m[1]) < cutoff:
+                (Path(dirpath) / f).unlink(missing_ok=True)
+        if dirpath != str(top) and not os.listdir(dirpath):
+            os.rmdir(dirpath)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+CHANGE_RE = re.compile(r"- (Path1|Path2)\s+(File changed|File was deleted|File is new)[^-]*- (.+)$")
+
+
+def history_from_log(text):
+    """History entries from the changes a bisync run reports."""
+    action = {"File changed": "changed", "File was deleted": "deleted", "File is new": "new"}
+    out = []
+    for line in ANSI_RE.sub("", text).splitlines():
+        m = CHANGE_RE.search(line)
+        if m and not LOSER_RE.match(m[3].rsplit("/", 1)[-1]):
+            out.append({"path": m[3].strip(), "action": action[m[2]],
+                        "side": "local" if m[1] == "Path1" else "cloud", "via": "sync"})
+    return out
+
+
 def clear_stale_locks(workdir):
     """Remove bisync lock files whose process is gone (e.g. after a logout or
     a crash), instead of waiting for --max-lock to expire. On a dual-boot disk
@@ -278,10 +481,13 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
     ffile = sd / "filters" / f"{key}.txt"
     if not ffile.exists() or ffile.read_text() != filters:
         ffile.write_text(filters)
-    digest = hashlib.sha256(filters.encode()).hexdigest()
+    marker_files = "".join(f"\n--exclude-if-present {m}" for m in EXCLUDE_IF_PRESENT)
+    digest = hashlib.sha256((filters + marker_files).encode()).hexdigest()
     # bisync names its listings after the real local path, which differs between
     # Linux and Windows, so each OS keeps its own listings and its own marker
     marker = sd / "bisync" / f"{key}.{platform.system().lower()}.cloudsync-ok"
+    log = sd / "logs" / f"{key}.log"
+    start = log.stat().st_size if log.exists() else 0
     clear_stale_locks(sd / "bisync")
     # first run, or selection changed since the last good run -> resync
     if not marker.exists() or marker.read_text().strip() != digest:
@@ -291,8 +497,15 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
             "--filters-file", str(ffile),
             "--create-empty-src-dirs", "--compare", "size,modtime",
             "--resilient", "--recover", "--max-lock", "5m",
+            # newer wins; the loser goes to the local backup (fix_conflicts)
             "--conflict-resolve", "newer", "--conflict-loser", "num",
-            "-v", "--log-file", str(sd / "logs" / f"{key}.log"), *extra]
+            "--conflict-suffix", "cs-local,cs-cloud",
+            # local files that are replaced or deleted by a change from the cloud
+            "--backup-dir1", str(backup_root() / key),
+            "--suffix", f" ({stamp()})", "--suffix-keep-extension",
+            "--color", "NEVER",
+            *[a for m in EXCLUDE_IF_PRESENT for a in ("--exclude-if-present", m)],
+            "-v", "--log-file", str(log), *extra]
     if encode and not IS_WINDOWS:
         args += ["--local-encoding", WINDOWS_ENCODING]
     if resync:
@@ -302,6 +515,14 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
     rc = rclone(*args, check=False).returncode
     if rc == 0 and not dry_run:
         marker.write_text(digest)
+    if not dry_run and not resync:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            f.seek(start)
+            text = f.read()
+        entries = history_from_log(text)
+        if rc == 0 and (".cs-local" in text or ".cs-cloud" in text):
+            entries += fix_conflicts(key, path1, path2)
+        add_history([{"remote": key, **e} for e in entries])
     return rc, resync
 
 
@@ -357,7 +578,14 @@ def write_status(**fields):
 def cmd_sync(args):
     if args.dry_run:
         return run_sync(args)
-    write_status(state="running", pid=os.getpid(), started=time.time())
+    with sync_lock():
+        write_status(state="running", pid=os.getpid(), started=time.time())
+        return locked_sync(args)
+
+
+def locked_sync(args):
+    f = history_file()
+    before = f.stat().st_size if f.exists() else 0
     try:
         rc = run_sync(args)
     except BaseException:
@@ -366,6 +594,22 @@ def cmd_sync(args):
     write_status(state="failed" if rc else "ok", finished=time.time(),
                  failed=run_sync.failed, logs=str(state_dir() / "logs"),
                  **({} if rc else {"last_ok": time.time()}))
+    try:
+        prof = load_profile()[0]
+        s = settings(prof)
+        with open(f, encoding="utf-8") if f.exists() else contextlib.nullcontext([]) as h:
+            if hasattr(h, "seek"):
+                h.seek(before)
+            new = [json.loads(line) for line in h if line.strip()]
+        cloud = [e for e in new if e.get("side") == "cloud" or e.get("action") == "conflict"]
+        if cloud and s["notify"] != "off" and getattr(args, "notify", False):
+            names = ", ".join(e["path"].rsplit("/", 1)[-1] for e in cloud[:4])
+            more = f" and {len(cloud) - 4} more" if len(cloud) > 4 else ""
+            notify(f"{len(cloud)} changes from the cloud", names + more)
+        prune_backups(s["backup_days"])
+        prune_history(s["backup_days"])
+    except (OSError, ValueError) as e:
+        print(f"cleanup failed: {e}")
     return rc
 
 
@@ -439,6 +683,43 @@ def cmd_pair(args):
     cmd_status(args)
 
 
+def cmd_watch(args):
+    if IS_WINDOWS:
+        sys.exit("cloudsync watch is Linux only")
+    import cloudsync_watch
+    machine_name()  # exits when not initialised
+    return cloudsync_watch.run(sys.modules[__name__])
+
+
+def cmd_config(args):
+    prof, online = load_profile()
+    s = prof.setdefault("settings", {})
+    if args.key is None:
+        for k, v in settings(prof).items():
+            print(f"{k} = {json.dumps(v)}")
+        return 0
+    if args.key not in DEFAULT_SETTINGS:
+        sys.exit(f"unknown setting {args.key}; known: {', '.join(DEFAULT_SETTINGS)}")
+    if args.value is None:
+        print(json.dumps(settings(prof)[args.key]))
+        return 0
+    if not online:
+        sys.exit("gdrive unreachable: can't change the settings")
+    default = DEFAULT_SETTINGS[args.key]
+    if isinstance(default, str):
+        value = args.value
+        if args.key == "notify" and value not in ("off", "summary", "each"):
+            sys.exit("notify: off, summary or each")
+    else:
+        value = json.loads(args.value)
+        if type(value) is not type(default):
+            sys.exit(f"{args.key} needs a {type(default).__name__}, e.g. {json.dumps(default)}")
+    s[args.key] = value
+    save_profile(prof)
+    print(f"{args.key} = {json.dumps(value)}")
+    return 0
+
+
 def cmd_init(args):
     sd = state_dir()
     sd.mkdir(parents=True, exist_ok=True)
@@ -498,8 +779,10 @@ def read_index_blocks(path):
 def cmd_index(args):
     prof, _ = load_profile()
     remotes = list_remotes()
+    extra = settings(prof)["index_remotes"]
     names = [n for n, cfg in prof["remotes"].items()
              if cfg.get("enabled") and n in remotes]
+    names += [n for n in extra if n in remotes and n not in names]
     configs = json.loads(rclone("config", "dump").stdout)
     out = index_file()
     old = read_index_blocks(out)
@@ -514,6 +797,11 @@ def cmd_index(args):
                "--drive-export-formats", "link.html", f"{name}:"]
         if name == SETTINGS_REMOTE:
             cmd += ["--exclude", f"/{SETTINGS_DIR}/**"]
+        # folder pairs are local anyway (e.g. ~/mypy): leave them out
+        for pair in prof.get("pairs", {}).values():
+            r, _, sub = pair["remote"].partition(":")
+            if r == name and sub.strip("/"):
+                cmd += ["--exclude", "/" + glob_escape(sub.strip("/")) + "/**"]
         r = rclone(*cmd, check=False)
         if r.returncode:
             print(f"{name}: FAILED: {r.stderr.strip().splitlines()[-1:]}")
@@ -522,7 +810,8 @@ def cmd_index(args):
                 blocks[name] = old[name]
             continue
         url, search = web_links(name, remotes[name], configs.get(name, {}))
-        head = "\t".join(["#source", name, name, str(local_root() / name), url, search])
+        head = "\t".join(["#source", name, tsv(remote_label(name, prof)),
+                          str(local_root() / name), url, search])
         items = json.loads(r.stdout or "[]")
         blocks[name] = [head] + [f"{name}\t{int(it['IsDir'])}\t{it.get('ID', '')}\t{tsv(it['Path'])}"
                                  for it in items]
@@ -587,7 +876,8 @@ def cmd_gui(args):
         except (ImportError, ValueError):
             pass  # no GTK 4 / libadwaita: fall back to Tk
         else:
-            return cloudsync_gtk.run(sys.modules[__name__], args.show)
+            return cloudsync_gtk.run(sys.modules[__name__],
+                                     "@history" if args.show_history else args.show)
     return gui_tk()
 
 
@@ -762,6 +1052,7 @@ def main():
     g = sub.add_parser("gui")
     g.add_argument("--tk", action="store_true", help="use the Tk window (default on Windows)")
     g.add_argument("--show", metavar="REMOTE:PATH", help="open at this folder (GNOME window)")
+    g.add_argument("--show-history", action="store_true", help="open the History tab")
     s = sub.add_parser("sync")
     s.add_argument("remote", nargs="*")
     s.add_argument("--resync", action="store_true", help="force a resync")
@@ -779,11 +1070,16 @@ def main():
     pa.add_argument("--filter", action="append",
                     help="extra rclone filter line, e.g. '+ /projects/**' (repeatable)")
     psub.add_parser("remove").add_argument("name")
+    sub.add_parser("watch", help="sync single changes within seconds (Linux)")
+    c = sub.add_parser("config", help="show or change settings")
+    c.add_argument("key", nargs="?")
+    c.add_argument("value", nargs="?", help='JSON for numbers/lists/objects, e.g. 30 or \'["switchdrive"]\'')
     i = sub.add_parser("init")
     i.add_argument("--machine")
     args = ap.parse_args()
     return {"gui": cmd_gui, "sync": cmd_sync, "status": cmd_status,
-            "init": cmd_init, "pair": cmd_pair, "index": cmd_index}[args.cmd](args)
+            "init": cmd_init, "pair": cmd_pair, "index": cmd_index,
+            "watch": cmd_watch, "config": cmd_config}[args.cmd](args)
 
 
 if __name__ == "__main__":

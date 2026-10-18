@@ -22,6 +22,8 @@ const APP_ID = 'cloudsync.desktop';
 const MAX_CANDIDATES = 200;  // checked for a local copy, best matches first
 const LINK_SUFFIX = '.link.html';
 const CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'cloudsync']);
+const HISTORY = GLib.build_filenamev([GLib.get_user_data_dir(), 'cloudsync', 'history.jsonl']);
+const RECENT = 8;
 
 function cloudsyncPath() {
     return GLib.find_program_in_path('cloudsync') ??
@@ -252,9 +254,13 @@ class Indicator extends PanelMenu.Button {
         this.add_child(this._icon);
 
         this._stateItem = new PopupMenu.PopupMenuItem('', {reactive: false});
+        this._watchItem = new PopupMenu.PopupMenuItem('', {reactive: false});
         this._indexItem = new PopupMenu.PopupMenuItem('', {reactive: false});
         this.menu.addMenuItem(this._stateItem);
+        this.menu.addMenuItem(this._watchItem);
         this.menu.addMenuItem(this._indexItem);
+        this._recent = new PopupMenu.PopupSubMenuMenuItem('Recent changes');
+        this.menu.addMenuItem(this._recent);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addAction('Sync now',
             () => spawn(['systemctl', '--user', 'start', '--no-block', 'cloudsync.service']));
@@ -265,7 +271,12 @@ class Indicator extends PanelMenu.Button {
             if (this._status.logs)
                 openUri(Gio.File.new_for_path(this._status.logs).get_uri());
         });
-        this.menu.connect('open-state-changed', (_m, open) => open && this._update());
+        this.menu.connect('open-state-changed', (_m, open) => {
+            if (open) {
+                this._update();
+                this._fillRecent();
+            }
+        });
 
         GLib.mkdir_with_parents(CACHE_DIR, 0o755);
         this._monitor = Gio.File.new_for_path(this._statusPath)
@@ -309,11 +320,48 @@ class Indicator extends PanelMenu.Button {
         } else {
             text = 'No sync yet';
         }
+        const w = s.watch ?? {};
+        const watching = w.pid && GLib.file_test(`/proc/${w.pid}`, GLib.FileTest.EXISTS);
+        if (watching) {
+            const feeds = Object.entries(w.feeds ?? {})
+                .map(([name, state]) => state === 'ok' ? name : `${name}: ${state}`);
+            this._watchItem.label.text = `Watching for changes${feeds.length ? '\n' + feeds.join('\n') : ''}`;
+        } else {
+            this._watchItem.label.text = 'Not watching (changes sync with the timer)';
+        }
         this._icon.icon_name = icon;
         this._stateItem.label.text = text;
         const mtime = fileMtime(this._index.path);
         this._indexItem.label.text = mtime === null ? 'No search index yet'
             : `Search index updated ${ago(mtime)}`;
+    }
+
+    _fillRecent() {
+        this._recent.menu.removeAll();
+        let lines = [];
+        try {
+            const [, bytes] = GLib.file_get_contents(HISTORY);
+            lines = new TextDecoder().decode(bytes).trimEnd().split('\n').slice(-RECENT).reverse();
+        } catch {}
+        const entries = lines.map(l => {
+            try {
+                return JSON.parse(l);
+            } catch {
+                return null;
+            }
+        }).filter(e => e);
+        if (!entries.length) {
+            this._recent.menu.addMenuItem(new PopupMenu.PopupMenuItem('No changes yet', {reactive: false}));
+            return;
+        }
+        for (const e of entries) {
+            const name = e.path.split('/').pop();
+            const where = e.side === 'cloud' ? 'from the cloud' : 'here';
+            const who = e.who ? `, ${e.who}` : '';
+            const label = `${name} – ${e.action} ${where}${who}, ${ago(e.t)}`;
+            this._recent.menu.addAction(label, () => spawn([cloudsyncPath(), 'gui', '--show-history']));
+        }
+        this._recent.menu.addAction('Show all…', () => spawn([cloudsyncPath(), 'gui', '--show-history']));
     }
 
     destroy() {

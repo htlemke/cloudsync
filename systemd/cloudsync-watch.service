@@ -1,0 +1,14 @@
+[Unit]
+Description=cloudsync watch: sync single changes within seconds
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/cloudsync watch
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=default.target

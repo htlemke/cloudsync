@@ -15,6 +15,14 @@ extension that also finds the files you *didn't* sync.
   opens them in the browser.
 - The folder selection ("profile") is stored on a Google Drive remote, one per
   machine, so it is shared by both OSes of a dual-boot computer.
+- `cloudsync watch` syncs single changes within seconds: local saves are
+  uploaded right away, changes in Google Drive and Nextcloud are picked up from
+  their change feeds. The full sync stays as a safety net.
+- Conflicts: the newer version wins. The other one, deleted files and files
+  replaced by a change from the cloud go to a **local** backup folder with the
+  same folder structure (kept 90 days), never as extra copies into the cloud.
+- A history of all changes (what, when, who, from where), optional desktop
+  notifications for changes from the cloud.
 - The GNOME Shell extension lists matching cloud-only files in the overview
   search (click: open in the browser, Ctrl+click: open the folder in the
   Cloud Sync window to add it), and shows the sync state in the top bar.
@@ -39,11 +47,12 @@ cloudsync init --machine laptop1     # once per computer
 cloudsync gui                        # pick folders ("Cloud Sync" in the app menu)
 cloudsync sync --dry-run             # look at the logs first
 cloudsync sync
-systemctl --user enable --now cloudsync.timer cloudsync-index.timer
+systemctl --user enable --now cloudsync.timer cloudsync-index.timer cloudsync-watch.service
 ```
 
-`cloudsync.timer` syncs every 15 minutes (desktop notification on failure),
-`cloudsync-index.timer` refreshes the search index every 6 hours.
+- `cloudsync-watch.service`: single changes within seconds (see below)
+- `cloudsync.timer`: full sync every 30 minutes (desktop notification on failure)
+- `cloudsync-index.timer`: refreshes the search index every 6 hours
 
 For the search extension, log out and in once (Wayland), then
 `gnome-extensions enable cloudsync-search@htlemke.github.io`.
@@ -55,6 +64,8 @@ For the search extension, log out and in once (Wayland), then
 - `cloudsync status`: what is selected, free disk space
 - `cloudsync pair add NAME LOCAL REMOTE [--filter '+ /sub/**' …]`, `cloudsync pair remove NAME`
 - `cloudsync index [REMOTE …]`: file-name index for the search extension
+- `cloudsync watch`: the watcher (normally run by `cloudsync-watch.service`)
+- `cloudsync config [KEY [VALUE]]`: settings, see below
 - `cloudsync init [--machine NAME]`
 
 ## Where things are
@@ -67,11 +78,61 @@ For the search extension, log out and in once (Wayland), then
 | search index | `~/.cache/cloudsync/index.tsv` |
 | credentials | rclone's own `rclone.conf`, never touched |
 
+| backups | `<root>/.backup/<remote>/` (local only, same folder structure) |
+| history | `~/.local/share/cloudsync/history.jsonl` |
+
 A change of selection triggers a `--resync` (newer file wins) on the next sync.
 Deselecting a folder offers to delete its local copy; the cloud copy stays.
 In pairs, Python caches, `.pixi`, `.venv` and `node_modules` are skipped;
 `.git` folders are synced, so don't work on the same repo on two computers
 between syncs.
+
+## Watching
+
+`cloudsync watch` (Linux) adds a fast path to the full sync:
+
+- **Local changes**: inotify reports saved files; a few seconds later (longer
+  for big files that keep growing) the file is uploaded. Renames are moves in
+  the cloud.
+- **Cloud changes**: Google Drive's changes feed and the Nextcloud/ownCloud
+  activity feed are polled every 30 s (`poll_seconds`); changed files are
+  downloaded, with the name of who changed them. Other remotes only sync with
+  the timer.
+- Deleted or renamed folders, local deletions, names that need the Windows
+  encoding and any error mark the folder for a full sync a minute later, so
+  bisync's safety checks (e.g. `--max-delete`) stay in charge of those.
+- Watcher and full sync never run at the same time (a lock file).
+
+**Google Drive needs your own client ID** for the changes feed: rclone's
+shared one is rate-limited ("quota exceeded"). See the rclone docs, then
+`rclone config update gdrive client_id=… client_secret=…` and
+`rclone config reconnect gdrive:`.
+
+## Conflicts, backups, history
+
+- A file changed on both sides: the newer version wins everywhere. The other
+  one goes to `<root>/.backup/<remote>/<same folders>/NAME (2026-10-18 14.03
+  conflict, local version).ext` (or `cloud version`): only on this computer,
+  never as a copy in the cloud.
+- Files that a change from the cloud replaces or deletes are kept there too
+  (`NAME (date time).ext`). Local deletions go to the cloud's trash.
+- Backups older than `backup_days` (90) are deleted.
+- Every change is recorded in the history (Cloud Sync window → History, and
+  *Recent changes* in the top-bar menu).
+
+## Settings
+
+`cloudsync config` (or the Settings tab in the window). Stored in the profile,
+so per machine and shared by its OSes.
+
+| Setting | Default | |
+|---|---|---|
+| `notify` | `summary` | changes from the cloud: `off`, `summary` (one notification) or `each` |
+| `notify_own` | `false` | also notify my own changes (e.g. from another computer) |
+| `backup_days` | `90` | how long backups and history are kept |
+| `poll_seconds` | `30` | how often the watcher asks the clouds |
+| `index_remotes` | `[]` | remotes to include in the search without syncing them, e.g. `'["nextcloud"]'` |
+| `labels` | `{}` | names for remotes in search results, history and notifications, e.g. `'{"gdrive": "Google Drive"}'` |
 
 ## GNOME Shell extension
 
@@ -90,8 +151,20 @@ finds those.
 
 **Top bar.** An icon shows the sync state (from `~/.cache/cloudsync/status.json`,
 written by `cloudsync sync`): idle, syncing, or a warning when the last sync
-failed or the last good one is more than 3 hours old. The menu has *Sync now*,
-*Open Cloud Sync*, *Refresh search index* and *Open logs*.
+failed or the last good one is more than 3 hours old. The menu shows whether
+the watcher runs (and the state of each change feed), the recent changes, and
+has *Sync now*, *Open Cloud Sync*, *Refresh search index* and *Open logs*.
+
+Search results show where they are from (the remote's label).
+
+## Tests
+
+```bash
+cd tests && python3 -m unittest -v
+```
+
+They run the real sync and watcher code against a local folder as "cloud"
+(an rclone alias in a temporary config); no real remote is touched.
 
 ## Dual boot with Windows
 

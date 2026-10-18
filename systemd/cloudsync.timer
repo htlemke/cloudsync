@@ -1,9 +1,9 @@
 [Unit]
-Description=Run cloudsync every 15 minutes
+Description=Full cloudsync every 30 minutes (safety net for cloudsync-watch)
 
 [Timer]
 OnStartupSec=3min
-OnUnitInactiveSec=15min
+OnUnitInactiveSec=30min
 Persistent=false
 
 [Install]
