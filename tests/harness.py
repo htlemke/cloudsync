@@ -75,3 +75,9 @@ class SyncTestCase(unittest.TestCase):
 
     def local(self):
         return self.root / "testcloud"
+
+    def assertCloudClean(self):
+        """No extra versions in the cloud: no timestamped or conflict copies."""
+        names = list(self.tree(self.cloud))
+        bad = [n for n in names if " (20" in n or ".cs-" in n]
+        self.assertEqual(bad, [], "extra copies in the cloud")

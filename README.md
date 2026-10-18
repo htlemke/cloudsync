@@ -83,7 +83,10 @@ For the search extension, log out and in once (Wayland), then
 
 A change of selection triggers a `--resync` (newer file wins) on the next sync.
 Deselecting a folder offers to delete its local copy; the cloud copy stays.
-In pairs, Python caches, `.pixi`, `.venv` and `node_modules` are skipped;
+Never synced: folders that contain a `pyvenv.cfg` (Python virtualenvs of any
+name), the side files of open SQLite databases (`*.db-wal`, `*.db-shm`), and
+`.DS_Store`/`Thumbs.db`/Office lock files. In pairs, also Python caches,
+`.pixi`, `.venv` and `node_modules`;
 `.git` folders are synced, so don't work on the same repo on two computers
 between syncs.
 

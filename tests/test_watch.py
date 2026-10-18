@@ -23,6 +23,7 @@ class Watch(SyncTestCase):
         self.u = self.w.units["testcloud"]
 
     def tearDown(self):
+        self.assertCloudClean()
         self.w.rc.close()
         os.close(self.w.ino.fd)
         super().tearDown()

@@ -57,7 +57,9 @@ IS_WINDOWS = platform.system() == "Windows"
 # that Windows can't store gets the same substitute name on both OSes.
 WINDOWS_ENCODING = ("Slash,LtGt,DoubleQuote,Colon,Question,Asterisk,Pipe,"
                     "BackSlash,Ctl,RightSpace,RightPeriod,InvalidUtf8,Dot")
-JUNK = ["**/.DS_Store", "**/Thumbs.db", "**/desktop.ini", "**/~$*", "**/.~lock.*#"]
+JUNK = ["**/.DS_Store", "**/Thumbs.db", "**/desktop.ini", "**/~$*", "**/.~lock.*#",
+        # side files of open SQLite databases: change all the time, useless alone
+        "**/*.db-wal", "**/*.db-shm", "**/*.sqlite-wal", "**/*.sqlite-shm"]
 # folders containing one of these files are never synced (Python virtualenvs,
 # whatever they are called: thousands of files that are useless elsewhere)
 EXCLUDE_IF_PRESENT = ["pyvenv.cfg"]
@@ -425,6 +427,20 @@ def fix_conflicts(key, path1, path2):
     return entries
 
 
+def file_backups(incoming, target):
+    """Move what bisync put into `incoming` (same folders) to the backup, with
+    the date in the name so several versions of a file can be kept."""
+    if not incoming.is_dir():
+        return
+    for dirpath, _dirs, files in os.walk(incoming):
+        rel = Path(dirpath).relative_to(incoming)
+        for f in files:
+            dst = target / rel / backup_name(f)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(os.path.join(dirpath, f), dst)
+    shutil.rmtree(incoming, ignore_errors=True)
+
+
 def prune_backups(days):
     """Delete backups older than `days` (date from the name), then empty folders."""
     top = backup_root()
@@ -432,6 +448,8 @@ def prune_backups(days):
         return
     cutoff = datetime.date.today() - datetime.timedelta(days=days)
     for dirpath, dirs, files in os.walk(top, topdown=False):
+        if Path(dirpath) == top / ".incoming" or top / ".incoming" in Path(dirpath).parents:
+            continue
         for f in files:
             m = STAMP_RE.search(f)
             if m and datetime.date.fromisoformat(m[1]) < cutoff:
@@ -488,6 +506,7 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
     marker = sd / "bisync" / f"{key}.{platform.system().lower()}.cloudsync-ok"
     log = sd / "logs" / f"{key}.log"
     start = log.stat().st_size if log.exists() else 0
+    incoming = backup_root() / ".incoming" / key
     clear_stale_locks(sd / "bisync")
     # first run, or selection changed since the last good run -> resync
     if not marker.exists() or marker.read_text().strip() != digest:
@@ -500,9 +519,9 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
             # newer wins; the loser goes to the local backup (fix_conflicts)
             "--conflict-resolve", "newer", "--conflict-loser", "num",
             "--conflict-suffix", "cs-local,cs-cloud",
-            # local files that are replaced or deleted by a change from the cloud
-            "--backup-dir1", str(backup_root() / key),
-            "--suffix", f" ({stamp()})", "--suffix-keep-extension",
+            # local files that are replaced or deleted by a change from the cloud;
+            # no --suffix: it would also rename overwritten files in the cloud
+            "--backup-dir1", str(incoming),
             "--color", "NEVER",
             *[a for m in EXCLUDE_IF_PRESENT for a in ("--exclude-if-present", m)],
             "-v", "--log-file", str(log), *extra]
@@ -520,9 +539,13 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
             f.seek(start)
             text = f.read()
         entries = history_from_log(text)
+        file_backups(incoming, backup_root() / key)
         if rc == 0 and (".cs-local" in text or ".cs-cloud" in text):
             entries += fix_conflicts(key, path1, path2)
         add_history([{"remote": key, **e} for e in entries])
+        if rc and "Must run --resync" in text:
+            # e.g. a file that changed while it was uploaded: start over next time
+            marker.unlink(missing_ok=True)
     return rc, resync
 
 

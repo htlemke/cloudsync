@@ -15,6 +15,11 @@ class ConflictsAndBackups(SyncTestCase):
         self.write(self.cloud / "gone.txt", "keep me")
         self.sync()
 
+    def tearDown(self):
+        if (self.cloud).exists():
+            self.assertCloudClean()
+        super().tearDown()
+
     def backups(self):
         return self.tree(self.root / ".backup" / "testcloud")
 
