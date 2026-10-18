@@ -114,13 +114,40 @@ class Watch(SyncTestCase):
         self.assertEqual(cloud.get("d/renamed.txt"), "v1")
         self.assertNotIn("d/report.txt", cloud)
 
-    def test_local_delete_is_left_to_the_full_sync(self):
+    def test_local_delete_is_deleted_in_the_cloud(self):
         (self.local() / "d/report.txt").unlink()
-        self.drain(3)  # a deletion counts once the file is still gone 2 s later
-        self.assertIsNotNone(self.u.dirty_at)
-        self.assertIn("d/report.txt", self.tree(self.cloud))
-        self.w.do_full(self.u)
+        self.drain(4)  # a deletion counts once the file is still gone 2 s later
         self.assertNotIn("d/report.txt", self.tree(self.cloud))
+        self.assertIn(("d/report.txt", "deleted", "local"), self.history())
+        self.assertIsNone(self.u.dirty_at)
+
+    def test_file_made_by_the_watcher_stays_deleted(self):
+        self.write(self.local() / "d/temp.txt", "short-lived")
+        self.drain()
+        self.assertIn("d/temp.txt", self.tree(self.cloud))
+        (self.local() / "d/temp.txt").unlink()
+        self.drain(4)
+        self.w.do_full(self.u)      # bisync never knew the file: must not bring it back
+        self.assertNotIn("d/temp.txt", self.tree(self.local()))
+        self.assertNotIn("d/temp.txt", self.tree(self.cloud))
+
+    def test_changed_in_cloud_then_deleted_here_goes_to_full_sync(self):
+        self.write(self.cloud / "d/report.txt", "changed in the cloud")
+        (self.local() / "d/report.txt").unlink()
+        self.drain(4)
+        self.assertIn("d/report.txt", self.tree(self.cloud))
+        self.assertIsNotNone(self.u.dirty_at)
+
+    def test_many_deletions_go_to_the_full_sync(self):
+        for i in range(8):
+            (self.local() / f"other{i}.txt").unlink()
+        cw.MASS_DELETE, old = 5, cw.MASS_DELETE
+        try:
+            self.drain(4)
+        finally:
+            cw.MASS_DELETE = old
+        self.assertEqual(sum(f.startswith("other") for f in self.tree(self.cloud)), 8)
+        self.assertIsNotNone(self.u.dirty_at)
 
     def test_virtualenv_is_ignored(self):
         self.write(self.local() / "env1/pyvenv.cfg", "home = /usr/bin")

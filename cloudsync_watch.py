@@ -42,6 +42,7 @@ QUIET = 3          # seconds without events before a local file is uploaded,
 QUIET_PER_MB = 4   # plus this per MB: big files that keep growing (logs,
 QUIET_MAX = 120    # session files) go up once instead of on every write
 DIRTY_DELAY = 60   # seconds after the last "dirty" event before a full bisync
+MASS_DELETE = 20   # more local deletions than this within 10 s: leave to bisync
 TOLERANCE = 1.5    # modification times closer than this count as equal
 IGNORE_RE = re.compile(r"(\.partial|\.swp|\.swx|~|\.crdownload|\.part|\.kate-swp)$"
                        r"|^\.goutputstream-|^\.#|^\.~lock\.|^~\$")
@@ -778,12 +779,20 @@ class Watcher:
                 if u.state.get(rel, {}).get("l"):
                     self.deleted[(u.key, rel)] = now
         # replaced files (rclone, editors) show up as deleted for a moment
+        recent = {}
+        for (key, rel), t in self.deleted.items():
+            if now - t < 10:
+                recent[key] = recent.get(key, 0) + 1
         for (key, rel), t in list(self.deleted.items()):
             if now - t > 2:
                 del self.deleted[(key, rel)]
                 u = self.units.get(key)
-                if u and not (u.local / rel).exists() and u.state.get(rel, {}).get("l"):
+                if not u or (u.local / rel).exists() or not u.state.get(rel, {}).get("l"):
+                    continue
+                if recent.get(key, 0) > MASS_DELETE or not u.fast(rel):
                     self.mark_dirty(u, f"{rel} deleted")
+                else:
+                    self.jobs.put(("delete", u, rel))
         # moved out of the watched folders = deleted
         for cookie, (u, rel, t) in list(self.moves.items()):
             if now - t > 2:
@@ -892,6 +901,23 @@ class Watcher:
             u.remember(rel, L, R)
         else:
             self.conflict(u, rel, L, R, who, own)
+
+    def do_delete(self, u, rel):
+        """A single file deleted here: delete it in the cloud (its trash), if
+        the cloud still has the version we know. Otherwise leave it to bisync."""
+        if (u.local / rel).exists():
+            return
+        known = u.state.get(rel, {})
+        R = self.remote_stat(u, rel)
+        if R is None:
+            u.forget(rel)
+        elif same(R, known.get("r")):
+            self.rc.call("operations/deletefile", fs=u.remote, remote=rel)
+            u.forget(rel)
+            self.history(u, rel, "deleted", "local")
+            log(f"{u.key}: deleted {rel} in the cloud")
+        else:
+            self.mark_dirty(u, f"{rel} deleted here but changed in the cloud")
 
     def do_move(self, u, old, new):
         known = u.state.get(old, {})
