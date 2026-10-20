@@ -184,6 +184,11 @@ Use a folder on a shared NTFS partition as root on both OSes, e.g.
 File names Windows can't store (`: ? * |` …) get rclone's substitute characters
 on both OSes, so both see the same names.
 
+## Development
+
+See [cloudsync-dev.md](cloudsync-dev.md): architecture, verified rclone
+behaviour, lessons learned, open issues.
+
 ## License
 
 MIT
