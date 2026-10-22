@@ -661,11 +661,15 @@ class Watcher:
         self.signature = self.profile_signature()
 
     def profile_signature(self):
+        """What the watcher depends on: the selection, the pairs, the settings.
+        (Not the file's mtime: loading the profile may rewrite the cache.)"""
         f = self.cs.state_dir() / "profile-cache.json"
         try:
-            return f.stat().st_mtime
-        except OSError:
+            prof = json.loads(f.read_text())
+        except (OSError, ValueError):
             return None
+        return json.dumps([prof.get("remotes"), prof.get("pairs"), prof.get("settings")],
+                          sort_keys=True)
 
     def watch_tree(self, u, top):
         for dirpath, dirs, _ in os.walk(top):
@@ -992,8 +996,8 @@ class Watcher:
             if now - last_check > 30:
                 last_check = now
                 if self.profile_signature() != self.signature:
-                    log("selection changed, restarting")  # systemd starts us again
-                    raise SystemExit(3)
+                    log("selection changed, restarting")  # Restart=always starts us again
+                    raise SystemExit(0)
             if now - last_status > 60:
                 last_status = now
                 self.status()

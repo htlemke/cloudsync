@@ -8,7 +8,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 APP_ID = "io.github.htlemke.CloudSync"
 
@@ -38,7 +38,8 @@ class Window(Adw.ApplicationWindow):
     def __init__(self, app, cs):
         super().__init__(application=app, title=f"Cloud Sync – {cs.machine_name()}")
         self.cs = cs
-        self.sel = cs.Selection()
+        self.sel = cs.Selection(cached=True)   # instant; the current one follows
+        self.edited = False
         self.set_default_size(820, 640)
         self.bound = {}  # remote -> {list item: (folder, check, size label)}
         self.updating = False
@@ -64,6 +65,9 @@ class Window(Adw.ApplicationWindow):
         self.spinner = Gtk.Spinner()
         header.pack_start(self.spinner)
         view.add_top_bar(header)
+        self.banner = Adw.Banner(title="Loading the current selection from Google Drive…",
+                                 revealed=True)
+        view.add_top_bar(self.banner)
         view.set_content(self.stack)
 
         free = cs.shutil.disk_usage(cs.local_root()).free / 1e9
@@ -79,8 +83,32 @@ class Window(Adw.ApplicationWindow):
                                         "document-open-recent-symbolic")
         self.stack.add_titled_with_icon(self.settings_page(), "settings", "Settings",
                                         "preferences-system-symbolic")
-        if not self.sel.online:
-            self.toast("gdrive unreachable – showing the cached selection")
+        bg(cs.load_profile, self.profile_loaded,
+           lambda e: self.note(f"Couldn't load the selection from Google Drive: {e}"))
+
+    def profile_loaded(self, res):
+        prof, online = res
+        if not online:
+            self.note("Google Drive unreachable – showing the selection saved on this computer")
+            return
+        same = (prof.get("remotes"), prof.get("settings")) == (self.sel.prof.get("remotes"),
+                                                               self.sel.prof.get("settings"))
+        if not same and self.edited:
+            self.note("The selection on Google Drive changed meanwhile; Save overwrites it")
+            return
+        self.sel.apply(prof, online)
+        if not same:
+            for name in self.sel.remotes:
+                self.switches[name].set_active(self.sel.enabled[name])
+                for li in self.bound[name]:
+                    self.show_state(li)
+            self.load_settings()
+        self.banner.set_revealed(False)
+
+    def note(self, text):
+        """A message in the banner below the header bar ("" hides it)."""
+        self.banner.set_title(GLib.markup_escape_text(text))
+        self.banner.set_revealed(bool(text))
 
     # --- one page per remote ------------------------------------------------
 
@@ -129,6 +157,9 @@ class Window(Adw.ApplicationWindow):
         li.set_child(expander)
         li.widgets = (expander, check, label, size, size_btn)
         check.connect("toggled", self.on_toggled, li)
+        click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        click.connect("pressed", self.on_menu, li)
+        h.add_controller(click)
         size_btn.connect("clicked", self.on_size, li)
 
     def bind_row(self, _factory, li, name):
@@ -161,10 +192,57 @@ class Window(Adw.ApplicationWindow):
         if self.updating:
             return
         f = li.folder
+        self.edited = True
         self.sel.toggle(f.remote, f.path)
         self.switches[f.remote].set_active(self.sel.enabled[f.remote])
         for other in self.bound[f.remote]:
             self.show_state(other)
+
+    def on_menu(self, gesture, _n, x, y, li):
+        f = li.folder
+        local = self.cs.local_root() / f.remote / f.path if f.path else self.cs.local_root() / f.remote
+        here = local.is_dir()
+        pop = Gtk.Popover(has_arrow=False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        def item(label, action, sensitive=True, tip=None):
+            b = Gtk.Button(label=label, css_classes=["flat"], sensitive=sensitive, tooltip_text=tip)
+            b.get_child().set_xalign(0)
+            b.connect("clicked", lambda *_: (pop.popdown(), action()))
+            box.append(b)
+        not_here = None if here else "Not synced to this computer"
+        item("Open location", lambda: self.open_path(local), here, not_here)
+        item("Open in browser", lambda: self.with_url(f, self.open_uri))
+        item("Copy path on disk", lambda: self.copy(str(local)), here, not_here)
+        item("Copy web link", lambda: self.with_url(f, self.copy))
+        item("Measure size", lambda: self.on_size(None, li))
+        pop.set_child(box)
+        widget = gesture.get_widget()
+        pop.set_parent(widget)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+        pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pop.popup()
+
+    def with_url(self, f, then):
+        self.busy(+1)
+
+        def done(url):
+            self.busy(-1)
+            if url:
+                then(url)
+            else:
+                self.toast("No web link known for this remote")
+        bg(lambda: self.cs.folder_url(f.remote, f.path), done,
+           lambda e: (self.busy(-1), self.toast(f"Link failed: {e}")))
+
+    def open_uri(self, uri):
+        Gio.AppInfo.launch_default_for_uri(uri, None)
+
+    def copy(self, text):
+        self.get_clipboard().set(text)
+        self.toast("Copied: " + text)
 
     def on_expand(self, row):
         f = row.get_item()
@@ -234,12 +312,20 @@ class Window(Adw.ApplicationWindow):
 
     def save(self, then_sync):
         self.read_settings()
-        try:
-            gone = self.sel.save()
-        except RuntimeError as e:
-            self.toast(str(e))
-            return
-        self.toast("Selection saved to gdrive")
+        self.saving(True)
+        bg(self.sel.save, lambda gone: self.saved(gone, then_sync),
+           lambda e: (self.saving(False), self.toast(str(e))))
+
+    def saving(self, on):
+        self.save_btn.set_sensitive(not on)
+        self.sync_btn.set_sensitive(not on)
+        self.busy(+1 if on else -1)
+        self.note("Saving the selection to Google Drive…" if on else "")
+
+    def saved(self, gone, then_sync):
+        self.saving(False)
+        self.edited = False
+        self.toast("Selection saved")
         listing = [f"{n}: {p}" for n, ps in gone.items() for p in ps]
         if not listing:
             if then_sync:
@@ -255,15 +341,30 @@ class Window(Adw.ApplicationWindow):
         dlg.set_default_response("keep")
 
         def answered(_d, resp):
-            if resp == "delete":
+            if resp != "delete":
+                if then_sync:
+                    self.sync()
+                return
+            self.busy(+1)
+            self.note("Deleting the local copies…")
+
+            def remove():
                 for n, ps in gone.items():
                     self.cs.remove_local(self.cs.local_root() / n, ps)
-            if then_sync:
-                self.sync()
+
+            def removed(_res):
+                self.busy(-1)
+                self.note("")
+                if then_sync:
+                    self.sync()
+            bg(remove, removed, lambda e: (self.busy(-1), self.note(""), self.toast(str(e))))
         dlg.connect("response", answered)
         dlg.present(self)
 
     def sync(self):
+        if self.cs.start_sync_service():
+            self.toast("Sync started – the top-bar icon shows its progress")
+            return
         self.sync_btn.set_sensitive(False)
         self.busy(+1)
 
@@ -398,6 +499,13 @@ class Window(Adw.ApplicationWindow):
         page.add(watch)
         self.modes = modes
         return page
+
+    def load_settings(self):
+        s = self.cs.settings(self.sel.prof)
+        self.notify_row.set_selected(self.modes.index(s["notify"]))
+        self.notify_own.set_active(s["notify_own"])
+        self.backup_days.set_value(s["backup_days"])
+        self.poll.set_value(s["poll_seconds"])
 
     def read_settings(self):
         """Settings from the widgets into the profile (saved with the selection)."""

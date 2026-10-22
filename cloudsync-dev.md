@@ -188,13 +188,15 @@ searched but not synced. The extension hides results that exist locally
 
 ## 5. Open issues (in order of importance)
 
-1. **Watcher restarts after every full sync (bug).** `profile_signature()` uses
+1. ~~**Watcher restarts after every full sync.**~~ Fixed: the signature is
+   the profile content, the cache is only rewritten when it changes, exit 0.
+   (Was: `profile_signature()` uses
    the mtime of `<root>/.cloudsync/profile-cache.json`, but `load_profile()`
    rewrites that file on every call (each `cloudsync sync`, `index`, GUI). In
    two days: 39 restarts, all `status=3`, systemd logs each as "Failed". Fix:
    signature = hash of the profile's `remotes`, `pairs`, `settings`; exit 0 on
    a real change (`Restart=always` restarts anyway); optionally write the cache
-   only when the content differs.
+   only when the content differs.)
 2. **Live application data in folder pairs.** A Home Assistant config inside a
    synced project (`ha-config/.storage/`) produced 68 conflict entries in two
    days; session files and `.git` produced two critical aborts (recovered by the
@@ -229,6 +231,12 @@ searched but not synced. The extension hides results that exist locally
 10. OneDrive for Business: rclone works technically, but organisations often
     require admin consent for rclone's app (seen: "Need admin approval"). A
     feed would use Microsoft Graph `delta`.
+
+11. Every Google Drive request is slow while the shared client ID is
+    throttled (loading the profile took 38 s, listing My Drive 6 s). The GUI no
+    longer waits for it (cached profile first, current one in the background,
+    saving in the background), but folder listing and "Open in browser" for
+    Drive folders still do. The own client ID is the real fix.
 
 ## 6. Ideas and backlog
 

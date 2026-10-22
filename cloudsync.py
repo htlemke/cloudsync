@@ -234,7 +234,9 @@ def load_profile():
     r = rclone("cat", profile_path(machine_name()), check=False)
     if r.returncode == 0 and r.stdout.strip():
         prof = json.loads(r.stdout)
-        cache.write_text(json.dumps(prof, indent=2))
+        text = json.dumps(prof, indent=2)
+        if not cache.exists() or cache.read_text() != text:
+            cache.write_text(text)
         return prof, True
     if cache.exists():
         return json.loads(cache.read_text()), False
@@ -856,10 +858,23 @@ MARK = {"on": "☑", "off": "☐", "partial": "◩"}
 class Selection:
     """GUI-independent state: profile, rules and enabled flag per remote."""
 
-    def __init__(self):
-        self.prof, self.online = load_profile()
+    def __init__(self, cached=False):
+        """cached: start from the profile saved on this computer (instant);
+        the window then loads the current one from gdrive in the background."""
+        prof = online = None
+        if cached:
+            try:
+                prof = json.loads((state_dir() / "profile-cache.json").read_text())
+            except (OSError, ValueError):
+                pass
+        if prof is None:
+            prof, online = load_profile()
         self.remotes = list_remotes()
-        cfgs = self.prof["remotes"]
+        self.apply(prof, online)
+
+    def apply(self, prof, online):
+        self.prof, self.online = prof, online
+        cfgs = prof.setdefault("remotes", {})
         self.rules = {n: get_rules(cfgs.get(n, {})) for n in self.remotes}
         self.enabled = {n: cfgs.get(n, {}).get("enabled", False) for n in self.remotes}
 
@@ -879,8 +894,41 @@ class Selection:
                 if (o := orphans(local_root() / n, self.rules[n]))}
 
     def sync_all(self):
-        return [(n, sync_remote(n, self.remotes[n], self.rules[n])[0])
-                for n in self.remotes if self.enabled[n] and any(self.rules[n].values())]
+        with sync_lock():
+            return [(n, sync_remote(n, self.remotes[n], self.rules[n])[0])
+                    for n in self.remotes if self.enabled[n] and any(self.rules[n].values())]
+
+
+def start_sync_service():
+    """Start `cloudsync sync` as the systemd user service (same lock, status
+    and notifications as the timer). False if there is no such service."""
+    if IS_WINDOWS or not shutil.which("systemctl"):
+        return False
+    if subprocess.run(["systemctl", "--user", "cat", "cloudsync.service"],
+                      capture_output=True).returncode:
+        return False
+    return subprocess.run(["systemctl", "--user", "start", "--no-block",
+                           "cloudsync.service"]).returncode == 0
+
+
+def folder_url(remote, path):
+    """Web address of a folder of a remote, None if unknown."""
+    conf = json.loads(rclone("config", "dump").stdout).get(remote, {})
+    url, _ = web_links(remote, conf.get("type", ""), conf)
+    if not url:
+        return None
+    item_id = ""
+    if "{id}" in url:
+        if path:
+            r = rclone("lsjson", "--stat", "--no-mimetype", f"{remote}:{path}", check=False)
+            if r.returncode == 0:
+                item_id = json.loads(r.stdout).get("ID", "")
+        else:
+            item_id = conf.get("root_folder_id", "")
+        if not item_id:
+            return "https://drive.google.com/drive/my-drive" if not path else None
+    return (url.replace("{id}", quote(item_id)).replace("{dir}", quote(path))
+            .replace("{path}", quote(path)).replace("&scrollto={name}", "").replace("{name}", ""))
 
 
 def list_dirs(name, path):
