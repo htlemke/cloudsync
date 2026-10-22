@@ -1,0 +1,10 @@
+[Unit]
+Description=cloudsync: %i as a folder (rclone mount, files load on demand)
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/cloudsync mount --run %i
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=10

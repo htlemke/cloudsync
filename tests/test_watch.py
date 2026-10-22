@@ -156,6 +156,16 @@ class Watch(SyncTestCase):
         self.drain()
         self.assertFalse(any("env1" in p for p in self.tree(self.cloud)))
 
+    def test_new_selection_is_synced_at_start(self):
+        self.assertIsNone(self.u.dirty_at)          # synced in setUp: up to date
+        self.prof["remotes"]["testcloud"]["rules"]["skip"] = True
+        w2 = cw.Watcher(self.cs)
+        try:
+            self.assertIsNotNone(w2.units["testcloud"].dirty_at)
+        finally:
+            w2.rc.close()
+            os.close(w2.ino.fd)
+
     def test_filters(self):
         f = cw.Filters("- **/.DS_Store\n- **/.venv/**\n+ /projects/**\n+ /CLAUDE.md\n- **")
         self.assertTrue(f.included("projects/a/b.jsonl"))

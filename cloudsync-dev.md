@@ -39,7 +39,7 @@ in this public repo.
 | `cloudsync_gtk.py` | GTK 4/libadwaita window: one tab per remote (tri-state folder tree), History, Settings; `--show REMOTE:PATH`, `--show-history` |
 | `cloudsync_watch.py` | `cloudsync watch`: inotify + cloud change feeds, single-file fast path through `rclone rcd` |
 | `search/…/extension.js` | GNOME Shell extension: overview search provider over the index, top-bar indicator |
-| `systemd/` | `cloudsync.service`+`.timer` (full sync, 30 min), `cloudsync-index.*` (6 h), `cloudsync-watch.service` |
+| `systemd/` | `cloudsync.service`+`.timer` (full sync, 30 min), `cloudsync-index.*` (6 h), `cloudsync-watch.service`, `cloudsync-mount@.service` (Type=notify, `cloudsync mount --run` execs `rclone mount`) |
 | `tests/` | `harness.py` (temp root, rclone alias remote as "cloud", in-memory profile), `test_sync.py`, `test_watch.py` |
 
 **Data and state**
@@ -237,6 +237,14 @@ searched but not synced. The extension hides results that exist locally
     longer waits for it (cached profile first, current one in the background,
     saving in the background), but folder listing and "Open in browser" for
     Drive folders still do. The own client ID is the real fix.
+
+12. The watcher starts a full sync at once for units whose filter digest
+    differs from the last good bisync (`needs_sync`): new remotes and newly
+    ticked folders no longer wait for the timer. `pair_filters()` and
+    `filter_digest()` are shared with `bisync()` so both compute the same text.
+13. Mount: the Drive mount waits for the throttled shared client ID (22 s to
+    mount My Drive); the extension shows "Connecting to …" after 2 s and falls
+    back to the browser if `systemctl start` fails.
 
 ## 6. Ideas and backlog
 

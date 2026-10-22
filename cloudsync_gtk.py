@@ -212,6 +212,7 @@ class Window(Adw.ApplicationWindow):
             box.append(b)
         not_here = None if here else "Not synced to this computer"
         item("Open location", lambda: self.open_path(local), here, not_here)
+        item("Open in cloud folder", lambda: self.open_mounted(f))
         item("Open in browser", lambda: self.with_url(f, self.open_uri))
         item("Copy path on disk", lambda: self.copy(str(local)), here, not_here)
         item("Copy web link", lambda: self.with_url(f, self.copy))
@@ -224,6 +225,17 @@ class Window(Adw.ApplicationWindow):
         pop.set_pointing_to(rect)
         pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
         pop.popup()
+
+    def open_mounted(self, f):
+        """The folder via the on-demand mount (files load when opened)."""
+        self.busy(+1)
+        self.toast(f"Connecting to {self.cs.remote_label(f.remote)}…")
+
+        def done(top):
+            self.busy(-1)
+            self.open_path(top / f.path if f.path else top)
+        bg(lambda: self.cs.mount(f.remote), done,
+           lambda e: (self.busy(-1), self.toast(str(e))))
 
     def with_url(self, f, then):
         self.busy(+1)

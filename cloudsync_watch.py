@@ -365,11 +365,8 @@ def build_units(cs):
     for name, cfg in prof.get("pairs", {}).items():
         rname = cfg["remote"].split(":", 1)[0]
         if cfg.get("enabled", True) and rname in remotes:
-            lines = [f"- {j}" for j in cs.JUNK] + cfg.get("filters", [])
-            if any(f.startswith("+") for f in cfg.get("filters", [])):
-                lines.append("- **")
             units.append(Unit(cs, f"pair-{name}", os.path.expanduser(cfg["local"]),
-                              cfg["remote"], "\n".join(lines), False, remotes[rname],
+                              cfg["remote"], cs.pair_filters(name, cfg), False, remotes[rname],
                               lambda n=name, c=cfg: cs.sync_pair(n, c)))
     return prof, units
 
@@ -656,7 +653,13 @@ class Watcher:
         self.ino = Inotify()
         for u in units:
             u.load_state()
+            u.local.mkdir(parents=True, exist_ok=True)
             self.watch_tree(u, u.local)
+            if self.cs.needs_sync(u.key, u.filters_text):
+                # new remote, or folders added to the selection: sync them now,
+                # not only with the next timer run
+                self.mark_dirty(u, "selection changed since the last full sync")
+                u.dirty_at -= DIRTY_DELAY
         log(f"watching {len(self.ino.paths)} folders in {', '.join(self.units)}")
         self.signature = self.profile_signature()
 

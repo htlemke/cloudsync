@@ -17,10 +17,21 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 Gio._promisify(Gio.File.prototype, 'load_contents_async');
+Gio._promisify(Gio.Subprocess.prototype, 'wait_check_async');
 
 const APP_ID = 'cloudsync.desktop';
 const MAX_CANDIDATES = 200;  // checked for a local copy, best matches first
 const LINK_SUFFIX = '.link.html';
+const HIDDEN_RE = /(^|\/)\.[^/]*\//;
+
+// t at the start of the name or of a word in it ("26b_tto_circular", "tto")
+function wordStart(name, t) {
+    for (let i = name.indexOf(t); i >= 0; i = name.indexOf(t, i + 1)) {
+        if (i === 0 || !/[a-z0-9]/.test(name[i - 1]))
+            return true;
+    }
+    return false;
+}
 const CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'cloudsync']);
 const HISTORY = GLib.build_filenamev([GLib.get_user_data_dir(), 'cloudsync', 'history.jsonl']);
 const RECENT = 8;
@@ -43,6 +54,22 @@ function openUri(uri) {
         Gio.AppInfo.launch_default_for_uri(uri, global.create_app_launch_context(0, -1));
     } catch (e) {
         logError(e, `cloudsync: can't open ${uri}`);
+    }
+}
+
+// Mount a remote as a folder (cloudsync-mount@KEY.service, files load on
+// demand); `systemctl start` returns once rclone reports the mount ready.
+async function mountRemote(key, label) {
+    const proc = Gio.Subprocess.new(
+        ['systemctl', '--user', 'start', `cloudsync-mount@${key}.service`], Gio.SubprocessFlags.NONE);
+    const slow = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+        Main.notify('Cloud Sync', `Connecting to ${label}…`);
+        return GLib.SOURCE_REMOVE;
+    });
+    try {
+        await proc.wait_check_async(null);
+    } finally {
+        GLib.source_remove(slow);
     }
 }
 
@@ -75,6 +102,7 @@ class Index {
         this._file = Gio.File.new_for_path(this.path);
         this._mtime = null;
         this.sources = new Map();
+        this.options = new Map();
         this.entries = [];
     }
 
@@ -89,6 +117,7 @@ class Index {
             return;
         const [bytes] = await this._file.load_contents_async(cancellable);
         const sources = new Map();
+        const options = new Map();
         const entries = [];
         for (const line of new TextDecoder().decode(bytes).split('\n')) {
             if (!line)
@@ -96,7 +125,9 @@ class Index {
             const f = line.split('\t');
             if (line.startsWith('#')) {
                 if (f[0] === '#source')
-                    sources.set(f[1], {label: f[2], local: f[3], url: f[4], searchUrl: f[5]});
+                    sources.set(f[1], {label: f[2], local: f[3], url: f[4], searchUrl: f[5], mount: f[6] || ''});
+                else if (f[0] === '#option')
+                    options.set(f[1], f[2]);
                 continue;
             }
             if (f.length < 4 || !sources.has(f[0]))
@@ -111,6 +142,7 @@ class Index {
             });
         }
         this.sources = sources;
+        this.options = options;
         this.entries = entries;
         this._mtime = mtime;
     }
@@ -153,17 +185,20 @@ class CloudSearchProvider {
             for (const t of terms) {
                 if (e.lowerName === t || e.lowerName === t + LINK_SUFFIX)
                     score = Math.min(score, 0);
-                else if (e.lowerName.startsWith(t))
+                else if (wordStart(e.lowerName, t))
                     score = Math.min(score, 1);
                 else if (e.lowerName.includes(t))
                     score = Math.min(score, 2);
             }
-            scored.push([score, e.path.length, i]);
+            if (HIDDEN_RE.test(e.path))
+                score += 3;   // inside .git, .ipynb_checkpoints & co.
+            scored.push([score, e.isDir ? 0 : 1, e.path.length, i]);
         });
-        scored.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+        // best match, folders before files, shorter paths first
+        scored.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
         // synced items are found by the normal file search already
         return scored.slice(0, MAX_CANDIDATES)
-            .map(([, , i]) => i)
+            .map(([, , , i]) => i)
             .filter(i => !this._isLocal(this._index.entries[i]))
             .map(String);
     }
@@ -219,18 +254,41 @@ class CloudSearchProvider {
             spawn([cloudsyncPath(), 'gui', '--show', `${e.source}:${e.isDir ? e.path : e.dir}`]);
             return;
         }
+        // Shift: the containing folder instead of the file
+        const folder = !!(mods & Clutter.ModifierType.SHIFT_MASK) && !e.isDir;
+        const rel = folder ? e.dir : e.path;
         const src = this._index.sources.get(e.source);
         if (this._isLocal(e)) {
-            openUri(Gio.File.new_for_path(this._localPath(e)).get_uri());
-        } else if (src?.url) {
-            openUri(src.url.replace('{id}', encodeURIComponent(e.id))
-                .replace('{path}', encodeURI(e.path))
-                .replace('{dir}', encodeURI(e.isDir ? e.path : e.dir))
-                .replace('{name}', encodeURIComponent(e.isDir ? '' : e.name)));
+            const local = GLib.build_filenamev([src.local, rel]);
+            openUri(Gio.File.new_for_path(local).get_uri());
+        } else if (src?.mount && this._index.options.get('open_cloud_files') !== 'browser') {
+            this._openMounted(e, src, rel, folder);
         } else {
+            this._openWeb(e, src, folder);
+        }
+    }
+
+    async _openMounted(e, src, rel, folder) {
+        try {
+            await mountRemote(e.source, src.label);
+            openUri(Gio.File.new_for_path(GLib.build_filenamev([src.mount, rel])).get_uri());
+        } catch (err) {
+            logError(err, `cloudsync: mounting ${e.source} failed`);
+            this._openWeb(e, src, folder);
+        }
+    }
+
+    _openWeb(e, src, folder) {
+        if (!src?.url) {
             Main.notify('Cloud Sync', `No web link for ${src?.label ?? e.source}. ` +
                 'Ctrl+click to open it in Cloud Sync.');
+            return;
         }
+        const dir = e.isDir ? e.path : e.dir;
+        openUri(src.url.replace('{id}', encodeURIComponent(e.id))
+            .replace('{path}', encodeURI(e.path))
+            .replace('{dir}', encodeURI(dir))
+            .replace('{name}', encodeURIComponent(e.isDir || folder ? '' : e.name)));
     }
 
     launchSearch(terms) {
@@ -261,6 +319,8 @@ class Indicator extends PanelMenu.Button {
         this.menu.addMenuItem(this._indexItem);
         this._recent = new PopupMenu.PopupSubMenuMenuItem('Recent changes');
         this.menu.addMenuItem(this._recent);
+        this._browse = new PopupMenu.PopupSubMenuMenuItem('Browse cloud folders');
+        this.menu.addMenuItem(this._browse);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this.menu.addAction('Sync now',
             () => spawn(['systemctl', '--user', 'start', '--no-block', 'cloudsync.service']));
@@ -275,6 +335,7 @@ class Indicator extends PanelMenu.Button {
             if (open) {
                 this._update();
                 this._fillRecent();
+                this._fillBrowse();
             }
         });
 
@@ -334,6 +395,24 @@ class Indicator extends PanelMenu.Button {
         const mtime = fileMtime(this._index.path);
         this._indexItem.label.text = mtime === null ? 'No search index yet'
             : `Search index updated ${ago(mtime)}`;
+    }
+
+    _fillBrowse() {
+        this._browse.menu.removeAll();
+        this._index.refresh(null).catch(() => {}).finally(() => {
+            for (const [key, src] of this._index.sources) {
+                if (!src.mount)
+                    continue;
+                this._browse.menu.addAction(src.label, async () => {
+                    try {
+                        await mountRemote(key, src.label);
+                        openUri(Gio.File.new_for_path(src.mount).get_uri());
+                    } catch (err) {
+                        Main.notify('Cloud Sync', `Couldn't open ${src.label}: ${err.message}`);
+                    }
+                });
+            }
+        });
     }
 
     _fillRecent() {

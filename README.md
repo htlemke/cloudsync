@@ -65,6 +65,7 @@ For the search extension, log out and in once (Wayland), then
 - `cloudsync pair add NAME LOCAL REMOTE [--filter '+ /sub/**' …]`, `cloudsync pair remove NAME`
 - `cloudsync index [REMOTE …]`: file-name index for the search extension
 - `cloudsync watch`: the watcher (normally run by `cloudsync-watch.service`)
+- `cloudsync mount REMOTE [--stop]`: the whole remote as a folder (see below)
 - `cloudsync config [KEY [VALUE]]`: settings, see below
 - `cloudsync init [--machine NAME]`
 
@@ -111,6 +112,23 @@ shared one is rate-limited ("quota exceeded"). See the rclone docs, then
 `rclone config update gdrive client_id=… client_secret=…` and
 `rclone config reconnect gdrive:`.
 
+## Cloud folders (mount on demand)
+
+`cloudsync mount REMOTE` (via `cloudsync-mount@REMOTE.service`) mounts the
+whole remote with `rclone mount` at `~/Cloud/<remote>` (`mount_dir`): files are
+fetched when opened (cache up to 5 GB, 72 h), Google Docs show up as
+`NAME.link.html` that open in the browser. Started on first use, it stays
+mounted until you log out. Used by:
+
+- the search: a cloud-only result opens from the mount in its normal program
+  (`open_cloud_files`: `mount`, or `browser` for the web page); **Shift+click**
+  opens the containing folder; Ctrl+click still adds it to the sync
+- the top-bar menu: *Browse cloud folders*
+- the window: right-click a folder → *Open in cloud folder*
+
+Edits in the mount go straight to the cloud (and from there to synced copies).
+Needs a connection; the first open of a big file takes as long as its download.
+
 ## Conflicts, backups, history
 
 - A file changed on both sides: the newer version wins everywhere. The other
@@ -136,6 +154,8 @@ so per machine and shared by its OSes.
 | `poll_seconds` | `30` | how often the watcher asks the clouds |
 | `index_remotes` | `[]` | remotes to include in the search without syncing them, e.g. `'["nextcloud"]'` |
 | `labels` | `{}` | names for remotes in search results, history and notifications, e.g. `'{"gdrive": "Google Drive"}'` |
+| `mount_dir` | `~/Cloud` | where remotes are mounted on demand |
+| `open_cloud_files` | `mount` | search results not synced here: open from the mount, or `browser` |
 
 ## GNOME Shell extension
 
@@ -158,7 +178,10 @@ failed or the last good one is more than 3 hours old. The menu shows whether
 the watcher runs (and the state of each change feed), the recent changes, and
 has *Sync now*, *Open Cloud Sync*, *Refresh search index* and *Open logs*.
 
-Search results show where they are from (the remote's label).
+Search results show where they are from (the remote's label). Ranking: exact
+name, then the search word at the start of the name or of a word in it
+(`26b_TTO_Circular` for "tto"), then anywhere; folders before files; results
+inside hidden folders (`.git`, `.ipynb_checkpoints`) last.
 
 ## Tests
 
