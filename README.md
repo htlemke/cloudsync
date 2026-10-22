@@ -178,6 +178,10 @@ failed or the last good one is more than 3 hours old. The menu shows whether
 the watcher runs (and the state of each change feed), the recent changes, and
 has *Sync now*, *Open Cloud Sync*, *Refresh search index* and *Open logs*.
 
+Files you sync are found by GNOME's normal desktop search: `cloudsync sync`
+adds each synced remote's folder to its search locations. The cloud search
+shows only what isn't here.
+
 Search results show where they are from (the remote's label). Ranking: exact
 name, then the search word at the start of the name or of a word in it
 (`26b_TTO_Circular` for "tto"), then anywhere; folders before files; results

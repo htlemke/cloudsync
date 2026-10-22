@@ -246,6 +246,10 @@ searched but not synced. The extension hides results that exist locally
     mount My Drive); the extension shows "Connecting to …" after 2 s and falls
     back to the browser if `systemctl start` fails.
 
+14. Synced folders vanish from the cloud search (it hides local files), so the
+    desktop search must index them: `cloudsync sync` adds `<root>/<remote>` of
+    every synced remote to Tracker's `index-recursive-directories`.
+
 ## 6. Ideas and backlog
 
 - Per-remote notification and history filters (e.g. hide a session-file pair).

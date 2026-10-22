@@ -659,6 +659,25 @@ def locked_sync(args):
     return rc
 
 
+def ensure_search_locations(names):
+    """GNOME desktop search (Tracker) indexes only listed folders and doesn't
+    follow symlinks: add <root>/<remote> for every synced remote."""
+    if IS_WINDOWS or not shutil.which("gsettings"):
+        return
+    schema = ["org.freedesktop.Tracker3.Miner.Files", "index-recursive-directories"]
+    r = subprocess.run(["gsettings", "get", *schema], capture_output=True, text=True)
+    if r.returncode:
+        return
+    import ast
+    try:
+        dirs = ast.literal_eval(r.stdout.strip().removeprefix("@as "))
+    except (ValueError, SyntaxError):
+        return
+    new = [str(local_root() / n) for n in names if str(local_root() / n) not in dirs]
+    if new:
+        subprocess.run(["gsettings", "set", *schema, str(dirs + new)])
+
+
 def run_sync(args):
     prof, online = load_profile()
     remotes = list_remotes()
@@ -690,6 +709,8 @@ def run_sync(args):
     if not online:
         print("note: gdrive unreachable, used the cached profile")
     run_sync.failed = failed
+    ensure_search_locations([n for n, cfg in prof["remotes"].items()
+                             if cfg.get("enabled") and n in remotes and n not in failed])
     if failed and args.notify and shutil.which("notify-send"):
         subprocess.run(["notify-send", "cloudsync failed", ", ".join(failed) +
                         f"\nsee {state_dir() / 'logs'}"])
