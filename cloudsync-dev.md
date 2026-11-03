@@ -83,8 +83,12 @@ mentions `.cs-`), history from the log, auto-resync marker reset on
 - cloud: `DriveFeed` (Drive API `changes.list`, token read from rclone.conf,
   refreshed by running `rclone about`), `NextcloudFeed` (OCS activity API,
   app password via `rclone reveal`), polled every `poll_seconds`
-- jobs run one at a time in a worker thread under the same `fcntl` lock as
-  `cloudsync sync`; transfers via `rclone rcd` (`operations/stat|copyfile|movefile|deletefile`)
+- locks (`fcntl`, `sync_lock(key)`): one per unit (remote or pair), taken by
+  every bisync and every watcher job of that unit; plus `sync.lock` for a whole
+  `cloudsync sync` run. Single-file jobs run in one worker thread, full syncs
+  in another; a single-file job whose unit is in a full sync (the watcher's or
+  the timer's) is retried 5 s later instead of blocking the others. Transfers
+  via `rclone rcd` (`operations/stat|copyfile|movefile|deletefile`)
 - known state per file = bisync listings (path1 = local, path2 = cloud) plus
   the watcher's own changes since (`watch-<key>.json`); reloaded when the
   marker is newer (a full sync ran elsewhere)
@@ -242,6 +246,15 @@ searched but not synced. The extension hides results that exist locally
     differs from the last good bisync (`needs_sync`): new remotes and newly
     ticked folders no longer wait for the timer. `pair_filters()` and
     `filter_digest()` are shared with `bisync()` so both compute the same text.
+    Seen 2026-11-02: that alone was not enough. "Save & sync" started
+    `cloudsync sync`, which held the one global lock for 24 min (all remotes,
+    gdrive throttled); the watcher's fast path and its own full sync waited
+    for all of it. Now: per-unit locks (above); `cloudsync sync` runs the units
+    that need a resync first; before that resync, `copy_added()` copies only
+    the newly ticked folders both ways (`rclone copy --update`, rclone lists
+    just those folders), using the selection of the last good bisync
+    (`<key>.<os>.rules.json`, remotes only, written after each good bisync);
+    the watcher's start-up full sync is skipped if another sync did it first.
 13. Mount: the Drive mount waits for the throttled shared client ID (22 s to
     mount My Drive); the extension shows "Connecting to …" after 2 s and falls
     back to the browser if `systemctl start` fails.

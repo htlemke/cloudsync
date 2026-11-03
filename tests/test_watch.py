@@ -35,7 +35,7 @@ class Watch(SyncTestCase):
             self.w.local_events()
             while not self.w.jobs.empty():
                 job = self.w.jobs.get()
-                with self.cs.sync_lock():
+                with self.cs.sync_lock(job[1].key):
                     job[1].refresh_if_synced()
                     getattr(self.w, "do_" + job[0])(*job[1:])
             time.sleep(0.1)
@@ -157,14 +157,56 @@ class Watch(SyncTestCase):
         self.assertFalse(any("env1" in p for p in self.tree(self.cloud)))
 
     def test_new_selection_is_synced_at_start(self):
-        self.assertIsNone(self.u.dirty_at)          # synced in setUp: up to date
+        self.assertTrue(self.w.full_jobs.empty())   # synced in setUp: up to date
         self.prof["remotes"]["testcloud"]["rules"]["skip"] = True
         w2 = cw.Watcher(self.cs)
         try:
-            self.assertIsNotNone(w2.units["testcloud"].dirty_at)
+            job = w2.full_jobs.get_nowait()
+            self.assertEqual(job, ("full", w2.units["testcloud"], True))
+            self.cs.sync_remote("testcloud", "alias", self.cs.get_rules(
+                self.prof["remotes"]["testcloud"]))   # e.g. the timer's run was faster
+            w2.do_full(*job[1:])                        # -> no second full sync
+            self.assertIsNone(w2.units["testcloud"].dirty_at)
         finally:
             w2.rc.close()
             os.close(w2.ino.fd)
+
+    def test_single_files_dont_wait_for_a_full_sync_of_another_folder(self):
+        import threading
+        with self.cs.sync_lock("other-remote"):    # a long full sync elsewhere
+            threading.Thread(target=self.w.worker, args=(self.w.jobs,), daemon=True).start()
+            self.write(self.local() / "d/new.txt", "brand new")
+            end = time.time() + 5
+            while "d/new.txt" not in self.tree(self.cloud) and time.time() < end:
+                self.w.local_events()
+                time.sleep(0.1)
+        self.assertEqual(self.tree(self.cloud).get("d/new.txt"), "brand new")
+
+    def test_single_files_wait_for_a_full_sync_of_their_folder(self):
+        class OneJob:  # hands the worker one job, then stops it
+            def __init__(q, job):
+                q.items, q.retried = [job], []
+
+            def get(q):
+                if not q.items:
+                    raise SystemExit
+                return q.items.pop()
+
+            def put(q, job):
+                q.retried.append(job)
+
+        self.write(self.local() / "d/report.txt", "local v2")
+        jobs = OneJob(("local", self.u, "d/report.txt"))
+        cw.RETRY, old = 0.1, cw.RETRY
+        try:
+            with self.cs.sync_lock(self.u.key):   # its full sync is running
+                with self.assertRaises(SystemExit):
+                    self.w.worker(jobs)
+            time.sleep(0.3)
+        finally:
+            cw.RETRY = old
+        self.assertEqual(self.tree(self.cloud)["d/report.txt"], "v1")  # not under bisync's feet
+        self.assertEqual(jobs.retried, [("local", self.u, "d/report.txt")])
 
     def test_filters(self):
         f = cw.Filters("- **/.DS_Store\n- **/.venv/**\n+ /projects/**\n+ /CLAUDE.md\n- **")

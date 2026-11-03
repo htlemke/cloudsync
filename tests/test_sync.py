@@ -91,6 +91,52 @@ class ConflictsAndBackups(SyncTestCase):
         self.assertIn("proj/main.py", cloud)
         self.assertFalse(any(".venv-x" in p for p in cloud), cloud)
 
+    def test_added_rules(self):
+        added = self.cs.added_rules
+        self.assertIsNone(added({"a": True}, {"a": True}))
+        self.assertIsNone(added({}, {"": True}))            # all new: the resync does it
+        self.assertEqual(added({"a": True}, {"a": True, "b": True, "b/x": False}),
+                         {"": False, "b": True, "b/x": False})
+        # a folder turned on inside one that was partly synced
+        self.assertEqual(added({"a": True, "a/b": False}, {"a": True}),
+                         {"": False, "a/b": True})
+        self.assertIsNone(added({"a": True, "b": True}, {"a": True}))  # only removed
+
+    def test_added_folder_is_copied_before_the_resync(self):
+        self.start()
+        self.write(self.cloud / "skip/x.txt", "cloud only")
+        self.write(self.cloud / "skip/old.txt", "cloud, older", age=600)
+        self.sync({"": True, "skip": False})
+        self.write(self.local() / "skip/old.txt", "local, newer")
+        calls = []
+        orig = self.cs.bisync
+        self.cs.bisync = lambda *a, **k: (calls.append(self.tree(self.local())), orig(*a, **k))[1]
+        try:
+            self.sync({"": True})
+        finally:
+            self.cs.bisync = orig
+        self.assertEqual(calls[0].get("skip/x.txt"), "cloud only")   # before the bisync ran
+        self.assertEqual(self.tree(self.cloud)["skip/old.txt"], "local, newer")
+        self.assertEqual(self.tree(self.local())["skip/old.txt"], "local, newer")
+
+    def test_changed_selection_syncs_first(self):
+        self.start()
+        self.prof["remotes"] = {"testcloud": {"enabled": True, "rules": {"": True}}}
+        self.prof["pairs"] = {"p": {"local": str(self.tmp / "pairdir"),
+                                    "remote": "testcloud:pair"}}
+        self.write(self.cloud / "pair/a.txt", "a")
+        order = []
+        orig = self.cs.sync_remote, self.cs.sync_pair
+        self.cs.sync_remote = lambda n, *a, **k: (order.append(n), orig[0](n, *a, **k))[1]
+        self.cs.sync_pair = lambda n, *a, **k: (order.append(n), orig[1](n, *a, **k))[1]
+        try:
+            import argparse
+            args = argparse.Namespace(remote=None, resync=False, dry_run=False, notify=False)
+            self.assertEqual(self.cs.run_sync(args), 0)
+        finally:
+            self.cs.sync_remote, self.cs.sync_pair = orig
+        self.assertEqual(order, ["p", "testcloud"])   # the pair never synced: it goes first
+
     def test_prune_backups(self):
         old = (datetime.date.today() - datetime.timedelta(days=100)).isoformat()
         b = self.root / ".backup" / "testcloud"

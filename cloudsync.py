@@ -127,17 +127,24 @@ def cache_dir():
 
 
 @contextlib.contextmanager
-def sync_lock():
-    """One sync at a time: the timer's `cloudsync sync` and the watcher."""
+def sync_lock(key=None, wait=True):
+    """key=None: one `cloudsync sync` run at a time. key=remote or pair: one
+    sync of that folder at a time (the full sync and the watcher), so the
+    watcher keeps working on the other folders during a long full sync.
+    wait=False yields False instead of waiting when the lock is taken."""
     if IS_WINDOWS:
-        yield
+        yield True
         return
     import fcntl
     cache_dir().mkdir(parents=True, exist_ok=True)
-    with open(cache_dir() / "sync.lock", "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with open(cache_dir() / (f"sync-{key}.lock" if key else "sync.lock"), "w") as f:
         try:
-            yield
+            fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -196,9 +203,10 @@ def add_history(entries):
     f = history_file()
     f.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
-    with open(f, "a", encoding="utf-8") as out:
-        for e in entries:
-            out.write(json.dumps({"t": now, **e}, ensure_ascii=False) + "\n")
+    lines = "".join(json.dumps({"t": now, **e}, ensure_ascii=False) + "\n" for e in entries)
+    # the watcher and `cloudsync sync` may write at the same time (~: no remote name)
+    with sync_lock("~history"), open(f, "a", encoding="utf-8") as out:
+        out.write(lines)
 
 
 def read_history(limit=500):
@@ -220,9 +228,10 @@ def prune_history(days):
     if not f.exists():
         return
     cutoff = time.time() - days * 86400
-    keep = [line for line in f.read_text(encoding="utf-8").splitlines()
-            if line and json.loads(line).get("t", 0) >= cutoff]
-    f.write_text("".join(line + "\n" for line in keep), encoding="utf-8")
+    with sync_lock("~history"):
+        keep = [line for line in f.read_text(encoding="utf-8").splitlines()
+                if line and json.loads(line).get("t", 0) >= cutoff]
+        f.write_text("".join(line + "\n" for line in keep), encoding="utf-8")
 
 
 # --- profile ---------------------------------------------------------------
@@ -568,12 +577,63 @@ def bisync(key, path1, path2, filters, resync=False, dry_run=False, encode=False
     return rc, resync
 
 
+def rules_file(key):
+    """The selection of the last good bisync (to find newly added folders)."""
+    return state_dir() / "bisync" / f"{key}.{platform.system().lower()}.rules.json"
+
+
+def added_rules(old, new):
+    """Rules for just the folders that `new` syncs and `old` didn't, or None."""
+    tops = sorted({p for p in set(old) | set(new)
+                   if effective(new, p) and not effective(old, p)})
+    tops = [p for p in tops if not any(t != p and inside(p, t) for t in tops)]
+    if not tops or "" in tops:
+        return None  # nothing new, or everything is new (= the resync itself)
+    rules = {"": False, **{t: True for t in tops}}
+    rules.update({p: v for p, v in new.items() if any(inside(p, t) for t in tops)})
+    return rules
+
+
+def copy_added(name, rtype, old, rules):
+    """Before the resync of a changed selection: copy the newly added folders
+    in both directions (newer wins, as in the resync). rclone lists only these
+    folders, so they arrive within minutes, not after a resync of everything."""
+    added = added_rules(old, rules)
+    if not added:
+        return
+    sd = state_dir()
+    ffile = sd / "filters" / f"{name}.added.txt"
+    ffile.write_text(render_filters(name, added))
+    local = str(local_root() / name)
+    incoming = backup_root() / ".incoming" / name
+    common = ["--filter-from", str(ffile), "--update", "--create-empty-src-dirs",
+              *[a for m in EXCLUDE_IF_PRESENT for a in ("--exclude-if-present", m)],
+              "-v", "--log-file", str(sd / "logs" / f"{name}.log")]
+    if not IS_WINDOWS:
+        common += ["--local-encoding", WINDOWS_ENCODING]
+    if rtype == "drive":
+        common.append("--drive-skip-gdocs")
+    print(f"{name}: new folders first: {', '.join(p for p, v in added.items() if v)}")
+    rclone("copy", f"{name}:", local, "--backup-dir", str(incoming), *common, check=False)
+    file_backups(incoming, backup_root() / name)
+    rclone("copy", local, f"{name}:", *common, check=False)
+
+
 def sync_remote(name, rtype, rules, resync=False, dry_run=False):
     local = local_root() / name
     local.mkdir(parents=True, exist_ok=True)
-    rc, resync = bisync(name, local, f"{name}:", render_filters(name, rules),
+    filters = render_filters(name, rules)
+    rfile = rules_file(name)
+    if not dry_run and needs_sync(name, filters) and rfile.exists():
+        try:
+            copy_added(name, rtype, json.loads(rfile.read_text()), rules)
+        except (OSError, ValueError) as e:
+            print(f"{name}: copying the new folders first failed: {e}")
+    rc, resync = bisync(name, local, f"{name}:", filters,
                         resync, dry_run, encode=True,
                         extra=["--drive-skip-gdocs"] if rtype == "drive" else [])
+    if rc == 0 and not dry_run:
+        rfile.write_text(json.dumps(rules))
     if rc == 0 and rtype == "drive":
         rc = sync_links(name, rules, dry_run)
     return rc, resync
@@ -682,6 +742,7 @@ def run_sync(args):
     prof, online = load_profile()
     remotes = list_remotes()
     failed = []
+    units = []  # (key, label, filters, run)
     for name, cfg in prof["remotes"].items():
         if args.remote and name not in args.remote:
             continue
@@ -691,21 +752,25 @@ def run_sync(args):
         if name not in remotes:
             print(f"{name}: no such rclone remote on this OS, skipped")
             continue
-        rc, resynced = sync_remote(name, remotes[name], rules, args.resync, args.dry_run)
-        print(f"{name}: {'ok' if rc == 0 else f'FAILED (exit {rc})'}"
-              f"{' (resync)' if resynced else ''}")
-        if rc:
-            failed.append(name)
+        units.append((name, name, render_filters(name, rules),
+                      lambda n=name, r=rules: sync_remote(n, remotes[n], r, args.resync,
+                                                          args.dry_run)))
     for name, cfg in prof.get("pairs", {}).items():
         if args.remote and name not in args.remote:
             continue
         if not cfg.get("enabled", True) or IS_WINDOWS:
             continue
-        rc, resynced = sync_pair(name, cfg, args.resync, args.dry_run)
-        print(f"pair {name}: {'ok' if rc == 0 else f'FAILED (exit {rc})'}"
-              f"{' (resync)' if resynced else ''}")
+        units.append((f"pair-{name}", f"pair {name}", pair_filters(name, cfg),
+                      lambda n=name, c=cfg: sync_pair(n, c, args.resync, args.dry_run)))
+    # new remotes and changed selections first: they are what the user waits for
+    units.sort(key=lambda u: not needs_sync(u[0], u[2]))
+    for key, label, _, run in units:
+        with sync_lock(key):
+            rc, resynced = run()
+        print(f"{label}: {'ok' if rc == 0 else f'FAILED (exit {rc})'}"
+              f"{' (resync)' if resynced else ''}", flush=True)
         if rc:
-            failed.append(name)
+            failed.append(key.removeprefix("pair-"))
     if not online:
         print("note: gdrive unreachable, used the cached profile")
     run_sync.failed = failed
@@ -993,9 +1058,14 @@ class Selection:
                 if (o := orphans(local_root() / n, self.rules[n]))}
 
     def sync_all(self):
+        names = [n for n in self.remotes if self.enabled[n] and any(self.rules[n].values())]
+        names.sort(key=lambda n: not needs_sync(n, render_filters(n, self.rules[n])))
+        out = []
         with sync_lock():
-            return [(n, sync_remote(n, self.remotes[n], self.rules[n])[0])
-                    for n in self.remotes if self.enabled[n] and any(self.rules[n].values())]
+            for n in names:
+                with sync_lock(n):
+                    out.append((n, sync_remote(n, self.remotes[n], self.rules[n])[0]))
+        return out
 
 
 def start_sync_service():

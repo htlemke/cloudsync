@@ -42,6 +42,7 @@ QUIET = 3          # seconds without events before a local file is uploaded,
 QUIET_PER_MB = 4   # plus this per MB: big files that keep growing (logs,
 QUIET_MAX = 120    # session files) go up once instead of on every write
 DIRTY_DELAY = 60   # seconds after the last "dirty" event before a full bisync
+RETRY = 5          # seconds until a file whose folder is in a full sync is tried again
 MASS_DELETE = 20   # more local deletions than this within 10 s: leave to bisync
 TOLERANCE = 1.5    # modification times closer than this count as equal
 IGNORE_RE = re.compile(r"(\.partial|\.swp|\.swx|~|\.crdownload|\.part|\.kate-swp)$"
@@ -629,7 +630,8 @@ class Notifier:
 class Watcher:
     def __init__(self, cs):
         self.cs = cs
-        self.jobs = queue.Queue()
+        self.jobs = queue.Queue()      # single files: seconds each
+        self.full_jobs = queue.Queue() # full bisyncs: minutes, so a thread of their own
         self.pending = {}         # (key, rel) -> time of last local event
         self.moves = {}           # inotify cookie -> (unit, rel, time)
         self.deleted = {}         # (key, rel) -> time; confirmed if still gone later
@@ -658,8 +660,8 @@ class Watcher:
             if self.cs.needs_sync(u.key, u.filters_text):
                 # new remote, or folders added to the selection: sync them now,
                 # not only with the next timer run
-                self.mark_dirty(u, "selection changed since the last full sync")
-                u.dirty_at -= DIRTY_DELAY
+                log(f"{u.key}: full sync now (selection changed since the last full sync)")
+                self.full_jobs.put(("full", u, True))
         log(f"watching {len(self.ino.paths)} folders in {', '.join(self.units)}")
         self.signature = self.profile_signature()
 
@@ -829,16 +831,22 @@ class Watcher:
 
     # jobs (worker thread, under the sync lock) ------------------------------------------
 
-    def worker(self):
+    def worker(self, jobs):
         while True:
-            job = self.jobs.get()
+            job = jobs.get()
+            u = job[1]
             try:
-                with self.cs.sync_lock():
-                    job[1].refresh_if_synced()
+                # a single file waits only for a full sync of its own folder
+                # (and is tried again later), never for the other folders
+                with self.cs.sync_lock(u.key, wait=job[0] == "full") as got:
+                    if not got:
+                        threading.Timer(RETRY, jobs.put, (job,)).start()
+                        continue
+                    u.refresh_if_synced()
                     getattr(self, "do_" + job[0])(*job[1:])
             except Exception as e:  # keep watching; the full sync fixes it
                 log(f"{job[0]} {job[2] if len(job) > 2 else ''}: {e}")
-                self.mark_dirty(job[1], f"error: {e}")
+                self.mark_dirty(u, f"error: {e}")
 
     def suppressed(self, path):
         want = self.suppress.get(str(path))
@@ -938,7 +946,10 @@ class Watcher:
         else:
             self.mark_dirty(u, f"{old} moved")
 
-    def do_full(self, u):
+    def do_full(self, u, only_if_needed=False):
+        if only_if_needed and not self.cs.needs_sync(u.key, u.filters_text):
+            log(f"{u.key}: already synced meanwhile")
+            return
         log(f"{u.key}: full sync")
         rc, _ = u.run_bisync()
         if rc == 0:
@@ -984,7 +995,8 @@ class Watcher:
                                     "folders": len(self.ino.paths), "feeds": self.feed_state})
 
     def run(self):
-        threading.Thread(target=self.worker, daemon=True).start()
+        for jobs in (self.jobs, self.full_jobs):
+            threading.Thread(target=self.worker, args=(jobs,), daemon=True).start()
         self.start_feeds()
         last_status = last_check = 0
         while True:
@@ -994,7 +1006,7 @@ class Watcher:
             for u in self.units.values():
                 if u.dirty_at and now - u.dirty_at >= DIRTY_DELAY:
                     u.dirty_at = None
-                    self.jobs.put(("full", u))
+                    self.full_jobs.put(("full", u))
             self.notifier.flush()
             if now - last_check > 30:
                 last_check = now
