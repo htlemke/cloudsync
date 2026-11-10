@@ -20,7 +20,7 @@ Gio._promisify(Gio.File.prototype, 'load_contents_async');
 Gio._promisify(Gio.Subprocess.prototype, 'wait_check_async');
 
 const APP_ID = 'cloudsync.desktop';
-const MAX_RESULTS = 200;  // cloud-only matches handed to the overview, best first
+const MAX_RESULTS = 200;  // matches handed to the overview, best first
 const LINK_SUFFIX = '.link.html';
 const HIDDEN_RE = /(^|\/)\.[^/]*\//;
 
@@ -35,6 +35,21 @@ function wordStart(name, t) {
 const CACHE_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'cloudsync']);
 const HISTORY = GLib.build_filenamev([GLib.get_user_data_dir(), 'cloudsync', 'history.jsonl']);
 const RECENT = 8;
+
+function fold(s) {
+    return s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+}
+
+// Does the normal file search (Tracker, via Nautilus) find this synced item?
+// It matches every term at the start of a word of the name only; '_' doesn't
+// split words for it, pure numbers and hidden files aren't indexed.
+function trackerFinds(e, terms) {
+    if (e.name.startsWith('.') || HIDDEN_RE.test(e.path))
+        return false;
+    const words = fold(e.name).split(/[^\p{L}\p{N}_]+/u)
+        .filter(w => w && !/^\p{N}+$/u.test(w));
+    return terms.every(t => words.some(w => w.startsWith(fold(t))));
+}
 
 function cloudsyncPath() {
     return GLib.find_program_in_path('cloudsync') ??
@@ -196,13 +211,14 @@ class CloudSearchProvider {
         });
         // best match, folders before files, shorter paths first
         scored.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
-        // synced items are found by the normal file search already; skip them
-        // before counting, or a query with many synced matches shows nothing
+        // synced items that the normal file search finds too are left to it
+        // (skipped before counting, or a query with many of them shows nothing)
         const ids = [];
         for (const [, , , i] of scored) {
             if (ids.length >= MAX_RESULTS)
                 break;
-            if (!this._isLocal(this._index.entries[i]))
+            const e = this._index.entries[i];
+            if (!this._isLocal(e) || !trackerFinds(e, terms))
                 ids.push(String(i));
         }
         return ids;
@@ -235,7 +251,7 @@ class CloudSearchProvider {
                 const name = isLink ? e.name.slice(0, -LINK_SUFFIX.length) : e.name;
                 let gicon;
                 if (e.isDir)
-                    gicon = new Gio.ThemedIcon({name: 'folder-remote'});
+                    gicon = new Gio.ThemedIcon({name: this._isLocal(e) ? 'folder' : 'folder-remote'});
                 else if (isLink)
                     gicon = new Gio.ThemedIcon({name: 'x-office-document'});
                 else

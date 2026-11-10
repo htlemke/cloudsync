@@ -273,6 +273,11 @@ searched but not synced. The extension hides results that exist locally
     `index-shortcuts.json` and excluded next time; `dedupe_shortcuts()` drops
     duplicates by ID. Extension: cloud-only results are counted after dropping
     local ones (before: top 200 first, e.g. "pdf" showed 63 of 6363).
+    Synced items are hidden only if Tracker finds them too (`trackerFinds`:
+    every term starts a word of the name; Tracker splits at spaces, `-`, `.`,
+    not at `_`, skips pure numbers and hidden files; checked against
+    `fts:match`, identical for "logo"). So `Bernina_logo.png` and path
+    searches ("achterwehr urkunde") show synced files too, opened locally.
 
 ## 6. Ideas and backlog
 
