@@ -263,6 +263,17 @@ searched but not synced. The extension hides results that exist locally
     desktop search must index them: `cloudsync sync` adds `<root>/<remote>` of
     every synced remote to Tracker's `index-recursive-directories`.
 
+15. Search: files behind Drive shortcuts were missing (`skip_shortcuts=true`,
+    needed for the sync, hid ~140 shortcut folders of My Drive from the index).
+    Index and mount now pass `--drive-skip-shortcuts=false` for drive remotes
+    without `root_folder_id`, **only with an own client ID** (with the shared
+    one the listing ended in rateLimitExceeded after 32 min). A shortcut's
+    lsjson ID is `<target>\t<shortcut>`: only the target is kept. Shortcuts to
+    another remote's root (`swissfel/Bernina-group`) are remembered in
+    `index-shortcuts.json` and excluded next time; `dedupe_shortcuts()` drops
+    duplicates by ID. Extension: cloud-only results are counted after dropping
+    local ones (before: top 200 first, e.g. "pdf" showed 63 of 6363).
+
 ## 6. Ideas and backlog
 
 - Per-remote notification and history filters (e.g. hide a session-file pair).

@@ -137,6 +137,16 @@ class ConflictsAndBackups(SyncTestCase):
             self.cs.sync_remote, self.cs.sync_pair = orig
         self.assertEqual(order, ["p", "testcloud"])   # the pair never synced: it goes first
 
+    def test_index_keeps_shortcut_files_in_their_own_remote(self):
+        blocks = {"gdrive": ["#source\tgdrive", "gdrive\t1\tR\tswissfel/Bernina-group",
+                             "gdrive\t0\tF1\tswissfel/Bernina-group/a.pdf",
+                             "gdrive\t0\tF2\tmine.pdf", "gdrive\t0\tF3\tmine2.pdf"],
+                  "bernina": ["#source\tbernina", "bernina\t0\tF1\ta.pdf"]}
+        self.cs.dedupe_shortcuts(blocks)
+        self.assertEqual(blocks["bernina"], ["#source\tbernina", "bernina\t0\tF1\ta.pdf"])
+        self.assertNotIn("gdrive\t0\tF1\tswissfel/Bernina-group/a.pdf", blocks["gdrive"])
+        self.assertIn("gdrive\t0\tF2\tmine.pdf", blocks["gdrive"])
+
     def test_prune_backups(self):
         old = (datetime.date.today() - datetime.timedelta(days=100)).isoformat()
         b = self.root / ".backup" / "testcloud"

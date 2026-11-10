@@ -20,7 +20,7 @@ Gio._promisify(Gio.File.prototype, 'load_contents_async');
 Gio._promisify(Gio.Subprocess.prototype, 'wait_check_async');
 
 const APP_ID = 'cloudsync.desktop';
-const MAX_CANDIDATES = 200;  // checked for a local copy, best matches first
+const MAX_RESULTS = 200;  // cloud-only matches handed to the overview, best first
 const LINK_SUFFIX = '.link.html';
 const HIDDEN_RE = /(^|\/)\.[^/]*\//;
 
@@ -196,11 +196,16 @@ class CloudSearchProvider {
         });
         // best match, folders before files, shorter paths first
         scored.sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]);
-        // synced items are found by the normal file search already
-        return scored.slice(0, MAX_CANDIDATES)
-            .map(([, , , i]) => i)
-            .filter(i => !this._isLocal(this._index.entries[i]))
-            .map(String);
+        // synced items are found by the normal file search already; skip them
+        // before counting, or a query with many synced matches shows nothing
+        const ids = [];
+        for (const [, , , i] of scored) {
+            if (ids.length >= MAX_RESULTS)
+                break;
+            if (!this._isLocal(this._index.entries[i]))
+                ids.push(String(i));
+        }
+        return ids;
     }
 
     async getInitialResultSet(terms, cancellable) {

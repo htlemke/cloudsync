@@ -860,6 +860,9 @@ def cmd_mount(args):
                              "--vfs-cache-mode", "full", "--vfs-cache-max-size", "5G",
                              "--vfs-cache-max-age", "72h", "--dir-cache-time", "5m",
                              "--poll-interval", "1m",
+                             # search results behind shortcuts open from here too
+                             *(["--drive-skip-shortcuts=false"]
+                               if follows_shortcuts(args.remote) else []),
                              # Google Docs as NAME.link.html: double-click opens the browser
                              "--drive-export-formats", "link.html",
                              "--volname", remote_label(args.remote)])
@@ -963,6 +966,36 @@ def read_index_blocks(path):
     return blocks
 
 
+def follows_shortcuts(name, configs=None):
+    """Index and mount list Drive shortcuts (the sync skips them: it would
+    download their targets again) of My Drive, not of shared folders. Only
+    with an own client ID: with rclone's shared one, listing them too ends in
+    rateLimitExceeded (seen: after 32 min) and the index is never refreshed."""
+    conf = (configs if configs is not None else json.loads(rclone("config", "dump").stdout)).get(name, {})
+    return (conf.get("type") == "drive" and not conf.get("root_folder_id")
+            and bool(conf.get("client_id")))
+
+
+def shortcuts_file():
+    """Shortcuts to folders that have their own remote: not listed again."""
+    return index_file().with_name("index-shortcuts.json")
+
+
+def dedupe_shortcuts(blocks):
+    """A shortcut in My Drive to a folder with its own remote (Bernina-group)
+    lists the same files twice: keep them only in the remote with fewer
+    entries, i.e. the one made for that folder. Same file = same Drive ID."""
+    owner = {}
+    for name in sorted(blocks, key=lambda n: len(blocks[n])):
+        for line in blocks[name][1:]:
+            fid = line.split("\t", 3)[2]
+            if fid:
+                owner.setdefault(fid, name)
+    for name, lines in blocks.items():
+        blocks[name] = lines[:1] + [line for line in lines[1:]
+                                    if owner.get(line.split("\t", 3)[2], name) == name]
+
+
 def cmd_index(args):
     prof, _ = load_profile()
     remotes = list_remotes()
@@ -974,6 +1007,12 @@ def cmd_index(args):
     out = index_file()
     old = read_index_blocks(out)
     blocks, failed = {}, []
+    roots = {c["root_folder_id"]: n for n, c in configs.items()
+             if c.get("type") == "drive" and c.get("root_folder_id") and n in names}
+    try:
+        skip = json.loads(shortcuts_file().read_text())
+    except (OSError, ValueError):
+        skip = {}
     for name in names:
         if args.remote and name not in args.remote:
             if name in old:
@@ -982,6 +1021,9 @@ def cmd_index(args):
         cmd = ["lsjson", "-R", "--fast-list", "--no-modtime", "--no-mimetype",
                # Google Docs as NAME.link.html, the name of their local link file
                "--drive-export-formats", "link.html", f"{name}:"]
+        if follows_shortcuts(name, configs):
+            cmd.append("--drive-skip-shortcuts=false")
+            cmd += [a for p in skip.get(name, []) for a in ("--exclude", "/" + glob_escape(p) + "/**")]
         if name == SETTINGS_REMOTE:
             cmd += ["--exclude", f"/{SETTINGS_DIR}/**"]
         # folder pairs are local anyway (e.g. ~/mypy): leave them out
@@ -1001,10 +1043,19 @@ def cmd_index(args):
                           str(local_root() / name), url, search,
                           "" if IS_WINDOWS else str(mount_point(name, prof))])
         items = json.loads(r.stdout or "[]")
-        blocks[name] = [head] + [f"{name}\t{int(it['IsDir'])}\t{it.get('ID', '')}\t{tsv(it['Path'])}"
+        for it in items:
+            # a shortcut's ID is "<target id>\t<shortcut id>"
+            it["ID"] = it.get("ID", "").split("\t")[0]
+            if it["IsDir"] and roots.get(it["ID"], name) != name:
+                skip.setdefault(name, [])
+                if it["Path"] not in skip[name]:
+                    skip[name].append(it["Path"])
+        blocks[name] = [head] + [f"{name}\t{int(it['IsDir'])}\t{it['ID']}\t{tsv(it['Path'])}"
                                  for it in items]
         print(f"{name}: {len(items)} entries")
+    dedupe_shortcuts(blocks)
     out.parent.mkdir(parents=True, exist_ok=True)
+    shortcuts_file().write_text(json.dumps(skip, indent=1))
     tmp = out.with_suffix(".tmp")
     tmp.write_text(f"#cloudsync-index\t{INDEX_VERSION}\n"
                    f"#option\topen_cloud_files\t{settings(prof)['open_cloud_files']}\n" +
