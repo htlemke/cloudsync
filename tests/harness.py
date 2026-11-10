@@ -33,16 +33,17 @@ class SyncTestCase(unittest.TestCase):
         import cloudsync as cs
         self.cs = cs
         self.prof = {"version": 2, "remotes": {}, "pairs": {}, "settings": {}}
-        self._orig = (cs.local_root, cs.load_profile, cs.save_profile)
+        self._orig = (cs.local_root, cs.load_profile, cs.save_profile, cs.ensure_search_locations)
         cs.local_root = lambda: self.root
         cs.load_profile = lambda: (self.prof, True)
         cs.save_profile = lambda prof: None
+        cs.ensure_search_locations = lambda names: None  # never touch the real desktop search
         (self.root / ".cloudsync").mkdir()
         (self.root / ".cloudsync" / "machine.txt").write_text("test\n")
 
     def tearDown(self):
         cs = self.cs
-        cs.local_root, cs.load_profile, cs.save_profile = self._orig
+        cs.local_root, cs.load_profile, cs.save_profile, cs.ensure_search_locations = self._orig
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
