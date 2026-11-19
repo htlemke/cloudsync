@@ -126,6 +126,7 @@ searched but not synced. The extension hides results that exist locally
 | `--resync` copies missing files both ways, newer wins, **never deletes** | files deleted on one side since the last sync come back once |
 | a file that changes during upload → "corrupted on transfer: sha1 hashes differ" → "Bisync critical error … Must run --resync" | marker reset → next run resyncs |
 | `--exclude-if-present pyvenv.cfg` works with bisync | virtualenvs of any name excluded |
+| `rclone config update <drive remote> key=value` re-runs the OAuth login (browser, new token) unless `config_refresh_token=false` | always pass it when only changing settings |
 | Drive: `skip_shortcuts=true` | otherwise shortcuts into shared folders download the target again (and shortcut loops log errors) |
 | Drive names with `/` are `／` in rclone's standard form | used when mapping Drive API names to paths |
 | `rclone rcd --rc-addr unix://…` works; fs strings can carry options: `:local,encoding="A,B,…":/path` | per-unit local encoding in one rcd |

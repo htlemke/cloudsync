@@ -40,7 +40,8 @@ Set up the rclone remotes (`rclone config`). The settings remote must be called
 `gdrive` (a Google Drive remote); the others can have any name. For Google
 Drive, [use your own client ID](https://rclone.org/drive/#making-your-own-client-id).
 If your Drive contains shortcuts to big shared folders, consider
-`rclone config update gdrive skip_shortcuts=true`.
+`rclone config update gdrive skip_shortcuts=true config_refresh_token=false`
+(without `config_refresh_token=false`, rclone logs in to Google again).
 
 ```bash
 cloudsync init --machine laptop1     # once per computer
