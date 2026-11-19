@@ -650,8 +650,11 @@ def sync_pair(name, cfg, resync=False, dry_run=False):
     local = Path(os.path.expanduser(cfg["local"]))
     local.mkdir(parents=True, exist_ok=True)
     rclone("mkdir", cfg["remote"], check=False)  # bisync needs both sides to exist
+    # folder pairs hold live files (session logs, .git): files changing during
+    # a run made the final listing check abort the whole sync ("out of sync,
+    # run --resync"); without it the next run just picks the change up
     return bisync(f"pair-{name}", local, cfg["remote"], pair_filters(name, cfg),
-                  resync, dry_run)
+                  resync, dry_run, extra=["--check-sync=false"])
 
 
 def pair_filters(name, cfg):
